@@ -17,6 +17,21 @@ Replay 核查一体化脚本（图形界面版）
   python AIReplay-check.py --selfcheck      # 界面自检（启动后自动退出）
   python AIReplay-check.py --check-update   # 只检测更新并打印结果（不启动界面）
   python AIReplay-check.py --version        # 打印当前版本号
+  python AIReplay-check.py --license        # 在命令行查看授权状态（排障用，界面不展示）
+
+软件授权（License Guard）:
+  - 由自建授权服务签发令牌，客户端仅做验签，校验全程在后台进行
+  - 界面（含日志区、状态栏、按钮）不显示任何授权相关信息
+  - 授权码已内置在脚本里，无需额外的 license.key 文件
+    （如需按客户分发不同授权码，优先级为：环境变量 LICENSE_KEY >
+      程序同目录 license.key > 脚本内置 LICENSE_KEY）
+  - **策略完全跟随后台设置**，客户端不自行揣测：
+      到期时的行为（硬闪退 / 弹提示后退出）、心跳间隔、断网容忍天数、
+      到期后宽限、设备数上限、令牌有效期 全部由后台下发并原样执行
+  - 每次启动都联网校验（LICENSE_ONLINE_CHECK_SEC = 0），后台改吊销 / 过期立刻生效；
+    只有连不上服务器时才按后台的「断网容忍天数」离线放行
+  - 命令行模式与降级弹窗模式同样要过校验，不存在绕过路径
+  - 失败原因只打到 stdout（exe 为 --noconsole，界面看不到任何痕迹）
 
 登录态说明:
   获取顺序（优先级由高到低）:
@@ -134,7 +149,7 @@ SENTRY_DSN = "https://1164181e93905c40acb94ed3c27679c1@o4511234196570112.ingest.
 SENTRY_TRACES_SAMPLE_RATE = 1.0
 # ============================================================
 
-APP_TITLE = "Replay 核查工具"
+APP_TITLE = "AIReplay 核查工具"
 FONT_UI = "Microsoft YaHei UI"
 
 # ====================== 版本与在线更新 ======================
@@ -151,6 +166,44 @@ UPDATE_ASSET_PREFIX = "AIReplay-"  # Release 中 exe 资产的文件名前缀
 UPDATE_AUTO_CHECK = True           # 启动时自动检测更新（环境变量 AIREPLAY_NO_UPDATE=1 可临时关闭）
 UPDATE_MARKER = ".aireplay_update.json"  # 记录上次在线更新后待清理的旧文件
 
+# ====================== 授权验证（License Guard）======================
+# 由自建 Cloudflare Worker（license-guard）签发授权令牌，客户端只做验签：
+#   · 到期时间写在服务端签发的令牌里，本地改不了
+#   · 系统时间被回拨会被检测（CLOCK_TAMPERED）
+#   · 断网超过服务端设定的「离线容忍天数」后必须联网校验，否则失效
+# 后台（管理页面）可随时调整到期时间、设备数、离线容忍天数、功能开关等策略。
+#
+# 校验方式：启动后立即在后台线程静默完成，界面不展示任何授权信息，
+#          也不改动按钮 / 状态栏 / 日志区；未通过时程序自行退出。
+LICENSE_ENABLED = True                                    # False = 跳过授权校验（仅供本地调试）
+LICENSE_SERVER = "https://license-guard.xhd19981202.workers.dev"
+LICENSE_APP_ID = "583729164"                              # 后台创建软件时填的 app_id
+LICENSE_PUBLIC_KEY = "LjZLPnhcuJ5qJEtNi1axHbc54lvk-wfN5wcCTfZzIEk"  # Ed25519 公钥(b64url)
+LICENSE_SIGN_ALG = "ed25519"                              # ed25519 | es256
+# 内置授权码。留空时依次回退到：环境变量 LICENSE_KEY → 程序同目录 license.key
+LICENSE_KEY = "8R45-XM60-AMYQ-7NF4"
+LICENSE_FILE_NAME = "license.key"                         # 备用授权码文件（内置授权码有效时可不存在）
+LICENSE_TIMEOUT = 8                                       # 单次校验请求超时（秒）
+# 运行期复查间隔（秒）—— 决定「程序一直开着」时多久能感知到后台的
+# 吊销 / 改期 / 设过期。0 = 不指定，**完全跟随后端下发的「心跳间隔」**
+# （后端当前是 21600 秒 = 6 小时，即运行中最长 6 小时感知到吊销）。
+# 若想更快生效，把它调小（例如 120），并同时把下面的上限也设成同样的值。
+LICENSE_WATCHDOG_SEC = 0
+# 复查间隔上限（秒）。0 = 不封顶，完全跟随后端心跳间隔（当前即 6 小时一次）。
+# ⚠️ SDK 只把 watchdog_interval_sec 当「第一次复查」的等待时间，之后的间隔会
+# 重新按后端心跳计算；所以想缩短复查间隔，这两项要一起改才有效。
+LICENSE_HEARTBEAT_CAP_SEC = 0
+# 缓存令牌「免联网直接放行」的宽限时长（秒）：
+#   0    = 每次校验都联网，后台吊销 / 改期 / 设过期立即生效（推荐，默认）
+#   >0   = 该时长内复用缓存不再联网，仅在超时后重新联网
+# 注意：无论取何值，只要联不上服务器，仍会按后端下发的「断网容忍天数」放行
+LICENSE_ONLINE_CHECK_SEC = 0
+# 以下两个只是「后端够不着时」的兜底默认值：
+# 正常情况下退出行为（闪退 / 弹提示）与退出码完全由后台
+# 「到期时的行为」和 exit_code 决定（拒绝响应里随策略一起下发）
+LICENSE_FAIL_MODE = "hard"                                # hard = 静默闪退（兜底）
+LICENSE_EXIT_CODE = 1                                     # 退出码（兜底）
+
 # ---- 以下是内部实现，一般无需修改 ----
 
 try:
@@ -165,6 +218,18 @@ try:
 except Exception as _e:  # Sentry 不可用不影响主流程
     try:
         print(f"[警告] Sentry 初始化失败（不影响运行）: {_e}", flush=True)
+    except Exception:
+        pass
+
+# ---- 授权 SDK（随程序一起分发，零第三方依赖；缺失时降级为「不校验」）----
+try:
+    import license_guard
+    _LICENSE_SDK_OK = True
+except Exception as _le:
+    license_guard = None
+    _LICENSE_SDK_OK = False
+    try:
+        print(f"[警告] 授权模块 license_guard 不可用: {_le}", flush=True)
     except Exception:
         pass
 
@@ -552,6 +617,175 @@ def cleanup_after_update():
         os.remove(marker)
     except OSError:
         pass
+
+
+# ==================================================================
+#                        授权验证（License Guard）
+# ==================================================================
+# 错误码 → 给用户看的中文处理建议：宁可说清楚原因，也不要无声闪退
+_LICENSE_HINTS = {
+    "NO_KEY":               "本机没有找到授权码。请把授权码文件 license.key 放到程序同目录，或联系供应商。",
+    "KEY_NOT_FOUND":        "授权码不存在或填写有误，请核对后重试。",
+    "LICENSE_EXPIRED":      "授权已到期，请联系供应商续期。",
+    "LICENSE_REVOKED":      "授权已被吊销，请联系供应商。",
+    "LICENSE_SUSPENDED":    "授权已被暂停，请联系供应商。",
+    "DEVICE_LIMIT":         "该授权码的可绑定设备数已用满。请在旧设备上解绑，或在管理后台移除一台设备后重试。",
+    "DEVICE_NOT_ACTIVATED": "本机尚未激活，且当前不允许自动占用新的设备位。",
+    "MACHINE_MISMATCH":     "授权绑定的是另一台电脑（本机状态文件可能被复制过），请联系供应商重新授权。",
+    "CLOCK_TAMPERED":       "检测到系统时间异常（被调回过去），请校准系统时间后重试。",
+    "OFFLINE_TOO_LONG":     "太久没能连上授权服务器，已超出离线容忍期。请连接网络后重试。",
+    "NETWORK":              "无法连接授权服务器，且本机没有可用的离线授权。请检查网络后重试。",
+    "BAD_SIGNATURE":        "授权令牌验签失败（公钥不匹配或文件被篡改），请联系供应商。",
+    "BAD_TOKEN":            "授权令牌格式异常，请联网重新校验。",
+    "APP_UNKNOWN":          "授权后台不认识当前 app_id，请核对 LICENSE_APP_ID 配置。",
+    "RATE_LIMITED":         "请求过于频繁，请稍后重试。",
+    "SDK_MISSING":          "程序缺少授权模块（license_guard.py），无法校验授权。",
+    "CONFIG_ERROR":         "授权配置不完整，无法校验授权。",
+}
+
+
+def license_hint(code, message=""):
+    """把授权错误码翻译成可执行的中文建议"""
+    return _LICENSE_HINTS.get(str(code or "").upper()) or (message or f"授权校验未通过（{code}）")
+
+
+def resolve_license_key():
+    """按优先级决定使用哪个授权码，返回 (key, 来源说明)
+
+      1. 环境变量 LICENSE_KEY —— 便于临时指定或自动化调用
+      2. 程序同目录的 license.key —— 分发时一个客户一个文件
+      3. 脚本内置的 LICENSE_KEY —— 本地自用
+    """
+    env = (os.environ.get("LICENSE_KEY") or "").strip()
+    if env:
+        return env, "环境变量 LICENSE_KEY"
+
+    for p in (os.path.join(script_dir(), LICENSE_FILE_NAME),
+              os.path.join(os.getcwd(), LICENSE_FILE_NAME)):
+        try:
+            if os.path.isfile(p):
+                text = open(p, encoding="utf-8", errors="ignore").read().strip()
+                if text:
+                    return text.splitlines()[0].strip(), f"{p}"
+        except Exception:
+            continue
+
+    builtin = (LICENSE_KEY or "").strip()
+    if builtin:
+        return builtin, "内置授权码"
+    return "", "未找到"
+
+
+def create_license_guard(on_denied=None):
+    """构造 LicenseGuard；未启用授权 / SDK 缺失 / 配置异常时返回 None
+
+    注意：on_denied 必须传入。SDK 只有在拿到 on_denied 时才会把失败「抛」回来，
+    否则它会自己按 fail_mode 处理 —— hard 直接 os._exit，message 会弹一个
+    系统对话框，两者都不受本程序控制（弹框会泄漏授权信息到界面）。
+    """
+    if not (LICENSE_ENABLED and _LICENSE_SDK_OK):
+        return None
+    key, _src = resolve_license_key()
+    try:
+        cfg = license_guard.GuardConfig(
+            server_url=LICENSE_SERVER,
+            app_id=str(LICENSE_APP_ID),
+            public_key=LICENSE_PUBLIC_KEY,
+            license_key=key,
+            sign_alg=LICENSE_SIGN_ALG,
+            request_timeout=LICENSE_TIMEOUT,
+            retry_times=2,
+            watchdog_interval_sec=LICENSE_WATCHDOG_SEC,
+            heartbeat_cap_sec=LICENSE_HEARTBEAT_CAP_SEC,   # 0 = 不封顶，跟随后端心跳
+            online_check_interval_sec=LICENSE_ONLINE_CHECK_SEC,  # 0 = 每次校验都联网
+            fail_mode=LICENSE_FAIL_MODE,   # 兜底默认；成功后端策略会覆盖它
+            exit_code=LICENSE_EXIT_CODE,   # 同上
+            on_denied=on_denied,
+        )
+        return license_guard.LicenseGuard(cfg)
+    except Exception:
+        return None
+
+
+def license_fail_behavior(guard=None):
+    """返回校验失败时该怎么做：(是否弹提示, 退出码)
+
+    **完全跟随后端设置**：后台「到期时的行为」= 直接闪退 / 弹提示后退出，
+    以及它下发的 exit_code，都会被 SDK 采纳到 guard.cfg 上，这里只负责读出来。
+    只有后端够不着（本地联不上服务器、策略拉取失败）时才用本地兜底默认值。
+    """
+    cfg = getattr(guard, "cfg", None)
+    mode = getattr(cfg, "fail_mode", None) or LICENSE_FAIL_MODE
+    code = getattr(cfg, "exit_code", None)
+    exit_code = code if isinstance(code, int) and code > 0 else (LICENSE_EXIT_CODE or 1)
+    return (mode == "message"), exit_code
+
+
+def verify_license(on_denied=None):
+    """执行一次授权校验。
+
+    返回 (ok, payload, guard)：
+      ok=True  → payload 为 LicenseInfo，guard 已通过校验（可用于启动看守）
+      ok=False → payload 为 (错误码, 中文处理建议)，guard 仍会返回（若非 None），
+                 因为它的 cfg 里带着后端下发的「到期时的行为」/ 退出码，
+                 调用方要据此决定弹不弹提示、用哪个退出码
+    """
+    if not LICENSE_ENABLED:
+        return True, None, None
+    if not _LICENSE_SDK_OK:
+        return False, ("SDK_MISSING", license_hint("SDK_MISSING")), None
+    guard = create_license_guard(on_denied=on_denied)
+    if guard is None:
+        return False, ("CONFIG_ERROR", license_hint("CONFIG_ERROR")), None
+    try:
+        return True, guard.verify(allow_offline=True), guard
+    except license_guard.LicenseError as e:
+        return False, (e.code, license_hint(e.code, e.message)), guard
+    except Exception as e:
+        return False, ("UNKNOWN", f"授权校验异常: {e}"), guard
+
+
+def enforce_license_cli():
+    """命令行 / 降级弹窗路径的授权校验（图形界面模式另有自己的后台校验线程）。
+
+    返回 0 表示通过；非 0 为应返回给系统的退出码（跟随后端下发的 exit_code）。
+    命令行不是「软件界面」，因此失败原因会打到控制台，方便定位问题。
+    """
+    if not LICENSE_ENABLED:
+        return 0
+    ok, payload, guard = verify_license(
+        on_denied=lambda c, m: None)          # 先自行接管，避免 SDK 直接闪退
+    if ok:
+        if guard is not None:
+            # 长期运行的命令行任务同样接受运行期复查：被吊销 / 到期立即退出
+            _quit_code = license_fail_behavior(guard)[1]
+            guard.cfg.on_denied = lambda c, m: _exit_now(_quit_code)
+            try:
+                guard.start_watchdog()
+            except Exception:
+                pass
+        return 0
+    code, msg = payload
+    _console(f"[授权] 校验未通过（{code}）：{msg}")
+    return license_fail_behavior(guard)[1]
+
+
+def license_detail_lines(info, key_source=""):
+    """生成多行授权详情（仅供控制台 / 排障使用，界面不展示）"""
+    if info is None:
+        return ["授权校验已关闭"]
+    fmt = lambda v: time.strftime("%Y-%m-%d %H:%M", time.localtime(int(v))) if v else "-"  # noqa: E731
+    return [
+        f"客户      : {info.customer or '未署名'}",
+        f"状态      : {info.status}{'（离线判定）' if info.offline else ''}",
+        f"功能开关  : {', '.join(info.features) if info.features else '无'}",
+        f"名义到期  : {fmt(info.expires_at)}",
+        f"硬到期    : {fmt(info.hard_expires_at)}",
+        f"剩余天数  : {info.days_left() if info.hard_expires_at else '永久'}",
+        f"设备上限  : {info.max_devices}（已用 {info.activations}）",
+        f"授权码来源: {key_source or '-'}",
+        f"本机指纹  : {license_guard.machine_id() if _LICENSE_SDK_OK else '-'}",
+    ]
 
 
 # ---------------------------------------------------------------- 登录 Token
@@ -1771,10 +2005,24 @@ if ctk is not None:
             global _LOG_SINK, _LOGIN_UI
             super().__init__()
 
+            # 授权校验出结果之前先把窗口藏起来。
+            # 否则主界面会在「校验还没回来」的时候就已经显示出来：网络慢时能有好几十秒，
+            # 期间界面看着完全正常（能选日期、能点按钮），很容易误判成「授权没生效也能用」。
+            # 校验通过 → _reveal_for_license() 显示窗口；校验失败 → 程序直接退出，窗口自始至终不出现。
+            self._ui_hidden = bool(LICENSE_ENABLED) and not selfcheck
+            if self._ui_hidden:
+                self.withdraw()
+
             self._q = queue.Queue()
             self._running = False
             self._update_dialog = None
             self._day_default = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
+            # 授权校验：全程在后台静默进行，界面不展示任何相关信息
+            self._license_ok = not LICENSE_ENABLED   # 关闭授权校验时视为已通过
+            self._license_pending = bool(LICENSE_ENABLED)
+            self._license_info = None
+            self._license_guard = None
+            self._pending_day = None                 # 校验完成前点过「开始」则先暂存，通过后自动继续
 
             self.title(f"{APP_TITLE}  v{current_app_version()}")
             self.configure(fg_color=CLR["win"])
@@ -1804,9 +2052,12 @@ if ctk is not None:
             self._append_log(f"{datetime.now():%H:%M:%S}  界面已就绪，默认抓取日期 {self._day_default}")
             self.after(80, self._drain)
             threading.Thread(target=self._preheat, daemon=True).start()
-            # 打开即检测更新（自检模式 / 环境变量关闭时不检测）
-            if not selfcheck and UPDATE_AUTO_CHECK and not os.environ.get("AIREPLAY_NO_UPDATE"):
-                self.after(1200, lambda: self._check_update(manual=False))
+            # 打开即在后台静默校验授权（自检模式跳过，避免打包自检依赖网络）
+            # 界面不显示任何校验状态、也不改变按钮外观；未通过时程序会自行退出
+            if not selfcheck:
+                self.after(120, self._start_license_check)
+            # 更新检查不在这里发起：必须等授权通过后再做，
+            # 否则「发现新版本」弹窗会在授权还没出结果时就冒出来（与「启动期无界面」矛盾）
 
         # ---------------- 布局 ----------------
         def _center_geometry(self, w, h):
@@ -1922,7 +2173,7 @@ if ctk is not None:
             self.lbl_foot = ctk.CTkLabel(foot, text="就绪，等待开始", font=self.f_body,
                                          text_color=CLR["sub"])
             self.lbl_foot.grid(row=0, column=0, sticky="w")
-            self.progress = ctk.CTkProgressBar(foot, width=240, height=6, corner_radius=3,
+            self.progress = ctk.CTkProgressBar(foot, width=200, height=6, corner_radius=3,
                                                progress_color=RUN_CLR, fg_color=CLR["ghost"])
             self.progress.set(0)
             self.progress.grid(row=0, column=2, sticky="e")
@@ -1961,6 +2212,10 @@ if ctk is not None:
                         self._on_failed(payload[0], payload[1])
                     elif kind == "ask_login":
                         self._show_login(payload)
+                    elif kind == "license_ok":
+                        self._on_license_ok(payload)
+                    elif kind == "license_fail":
+                        self._on_license_fail(payload)
                     elif kind == "update":
                         self._show_update_dialog(payload)
                     elif kind == "update_progress":
@@ -2013,7 +2268,129 @@ if ctk is not None:
             except Exception:
                 pass
 
+        # ---------------- 授权验证（后台静默，界面不展示）----------------
+        def _reveal_for_license(self):
+            """授权校验通过（或授权被关闭）后才把窗口显示出来。"""
+            if getattr(self, "_ui_hidden", False):
+                self._ui_hidden = False
+                try:
+                    self.deiconify()
+                    self.lift()
+                except Exception:
+                    pass
+
+        def _start_license_check(self):
+            """后台静默校验授权。
+
+            界面上不出现任何授权相关文字，也不改动按钮 / 状态栏：
+              - 校验中：窗口尚未显示（见 __init__），用户看不到任何东西
+              - 校验通过：显示窗口，静默放行
+              - 校验失败：程序直接退出（仅在没有输出通道时于控制台留痕）
+            """
+            if not LICENSE_ENABLED:
+                self._license_ok = True
+                self._license_pending = False
+                _console("[授权] 已按配置跳过授权校验")
+                self._reveal_for_license()
+                self._schedule_update_check()
+                return
+
+            self._license_ok = False
+            self._license_pending = True
+            threading.Thread(target=self._license_worker, daemon=True).start()
+
+        def _license_worker(self):
+            """工作线程：联网校验（首次会自动占用一个设备位）
+
+            必须传 on_denied：这样 SDK 只负责把错误码交回来，
+            由本程序决定怎么退出，不会自己去弹系统对话框。
+            """
+            denied = {}
+            try:
+                ok, payload, guard = verify_license(
+                    on_denied=lambda c, m: denied.update(code=c, message=m))
+            except Exception as e:
+                ok, payload, guard = False, ("UNKNOWN", f"授权校验异常: {e}"), None
+            if not ok and denied:
+                # 以 on_denied 截获到的错误码为准（比异常里带的更准确）
+                c, m = denied.get("code"), denied.get("message")
+                payload = (c, license_hint(c, m))
+            self._license_guard = guard
+            self._q.put(("license_ok" if ok else "license_fail", payload))
+
+        def _on_license_ok(self, info):
+            self._license_ok = True
+            self._license_pending = False
+            self._license_info = info
+            self._reveal_for_license()
+
+            who = (info.customer if info else None) or "未署名"
+            if info is not None and info.hard_expires_at:
+                tail = f"剩余 {info.days_left()} 天"
+            else:
+                tail = "永久有效"
+            if info is not None and info.offline:
+                tail += "（本次为离线判定）"
+            _console(f"[授权] 校验通过：{who} · {tail}")
+
+            self._start_license_watchdog()
+
+            # 授权通过后才检测更新（避免未通过时界面上冒出更新弹窗）
+            self._schedule_update_check()
+
+            # 用户在校验完成前就点了「开始」→ 现在静默补跑
+            if self._pending_day:
+                self._pending_day = None
+                self.after(10, self._on_start)
+
+        def _on_license_fail(self, payload):
+            code, msg = payload
+            self._license_ok = False
+            self._license_pending = False
+            self._pending_day = None
+            # 弹不弹提示、用哪个退出码，完全跟随后台「到期时的行为」/ exit_code
+            show_prompt, exit_code = license_fail_behavior(self._license_guard)
+            _console(f"[授权] 校验未通过: [{code}] {msg}"
+                     f"（后台设定：{'弹提示后退出' if show_prompt else '直接闪退'}，退出码 {exit_code}）")
+            if show_prompt:
+                try:
+                    import tkinter.messagebox as mb
+                    mb.showerror("无法启动",
+                                 f"程序无法启动，已退出。\n\n{msg}\n\n（错误代码：{code}）")
+                except Exception:
+                    pass
+            # 未通过校验就不进入主界面
+            self.after(200, lambda: _exit_now(exit_code))
+
+        def _start_license_watchdog(self):
+            """后台看守：运行期间授权失效（到期 / 被吊销 / 被解绑）时按后端设定退出
+
+            复用启动时已通过校验的那个 guard，不再重新构造（避免二次激活占设备位）。
+            刻意不改 fail_mode / exit_code：它们已被后端策略刷新，后端是唯一权威。
+            """
+            guard = self._license_guard
+            if guard is None:
+                return
+            try:
+                # 只接管「失败之后怎么退出」，不覆盖后端下发的退出行为
+                guard.cfg.on_denied = lambda c, m: self._q.put(
+                    ("license_fail", (c, license_hint(c, m))))
+                guard.start_watchdog()
+            except Exception:
+                pass
+
         # ---------------- 在线更新 ----------------
+        def _schedule_update_check(self):
+            """安排启动后的自动更新检查。
+
+            刻意不放在 __init__ 里：更新弹窗是个独立顶层窗口，不受主窗口 withdraw()
+            影响，若在授权校验出结果前弹出，就会在「本应无任何界面」的启动期露脸。
+            因此统一在**授权通过**（或授权被关闭）之后才发起。
+            """
+            if not UPDATE_AUTO_CHECK or os.environ.get("AIREPLAY_NO_UPDATE"):
+                return
+            self.after(1200, lambda: self._check_update(manual=False))
+
         def _check_update(self, manual=False):
             """检测新版本；manual=True 表示手动点击（会输出检测过程与结果）"""
             try:
@@ -2073,6 +2450,11 @@ if ctk is not None:
                 self.after(1500, lambda: self.entry_day.configure(border_color=CLR["line"]))
                 self._append_log(f"{datetime.now():%H:%M:%S}  [提示] 日期格式不正确，请按 20260924 格式输入")
                 self._set_state("日期有误", ERR_CLR, "请检查抓取日期格式")
+                return
+
+            # 授权仍在后台校验中：静默记下请求，校验通过后自动继续（界面无任何提示）
+            if not self._license_ok:
+                self._pending_day = day
                 return
 
             self._running = True
@@ -2162,7 +2544,7 @@ if ctk is not None:
 # ==================================================================
 def _parse_args(argv):
     """返回 (day, selfcheck, action)；
-    day 为 YYYYMMDD 或 None，action ∈ {None, "check_update", "version"}"""
+    day 为 YYYYMMDD 或 None，action ∈ {None, "check_update", "version", "license"}"""
     day, selfcheck, action, rest = None, False, None, []
     i = 0
     while i < len(argv):
@@ -2173,6 +2555,8 @@ def _parse_args(argv):
             action = "check_update"
         elif a in ("--version", "-V"):
             action = "version"
+        elif a in ("--license", "-L"):
+            action = "license"
         elif a in ("--cli", "--date", "-d"):
             i += 1
             if i < len(argv):
@@ -2205,6 +2589,29 @@ def main():
         _console(current_app_version())
         return 0
 
+    # --license：在命令行查看授权状态（排障用；界面依旧不展示任何授权信息）
+    if action == "license":
+        if not LICENSE_ENABLED:
+            _console("授权校验已关闭（LICENSE_ENABLED = False）")
+            return 0
+        if not _LICENSE_SDK_OK:
+            _console("授权模块 license_guard.py 不可用")
+            return 1
+        key, src = resolve_license_key()
+        if not key:
+            _console("未找到授权码（内置为空，且无环境变量 LICENSE_KEY / 同目录 license.key）")
+            return 1
+        denied = {}
+        ok, payload, _guard = verify_license(
+            on_denied=lambda c, m: denied.update(code=c, message=m))
+        if ok:
+            for line in license_detail_lines(payload, src):
+                _console(line)
+            return 0
+        code, msg = payload
+        _console(f"校验未通过: [{code}] {msg}")
+        return 1
+
     # --check-update：只检测更新并打印结果，不启动界面
     if action == "check_update":
         status, payload = check_for_update()
@@ -2222,6 +2629,9 @@ def main():
 
     # 1. 命令行静默模式（传日期）
     if day_arg:
+        rc = enforce_license_cli()     # 静默模式同样要过授权，否则等于可以绕开校验
+        if rc:
+            return rc
         try:
             datetime.strptime(day_arg, "%Y%m%d")
         except ValueError:
@@ -2251,6 +2661,9 @@ def main():
             return 1
 
     # 3. 降级：原生弹窗交互
+    rc = enforce_license_cli()
+    if rc:
+        return rc
     default_day = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
     day = ask_date(default_day)
     if not day:
