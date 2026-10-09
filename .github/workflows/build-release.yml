@@ -1,0 +1,169 @@
+name: Build EXE & Publish Release
+
+# ── 触发条件 ───────────────────────────────────────────────────────
+# 1) 向 main / master 推送，且改动包含 .py 文件
+#      → 自动构建 exe 并发布 Release，版本号自动递增（v1.0.<构建号>）
+# 2) 推送 tag（如 git tag v1.2.0 && git push origin v1.2.0）
+#      → 以该 tag 作为版本号构建并发布 Release
+# 3) 在 GitHub 仓库 Actions 页面手动 Run workflow
+#      → 可自定义版本号，留空则自动生成
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - '**/*.py'
+      - 'requirements.txt'
+      - '.github/workflows/build-release.yml'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（如 v1.2.0；留空则自动生成 v1.0.<构建号>）'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+# 同一分支/标签的构建串行执行，避免并发发布互相覆盖
+concurrency:
+  group: build-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  APP_NAME: AIReplay         # 生成的 exe 名称（不含扩展名）
+  ENTRY: AIReplay-check.py   # 入口脚本
+
+jobs:
+  build:
+    name: 构建 exe 并发布 Release
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装依赖
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: 计算版本号
+        id: ver
+        shell: pwsh
+        run: |
+          $ref   = "${{ github.ref }}"
+          $event = "${{ github.event_name }}"
+          $input = "${{ github.event.inputs.version }}"
+
+          if ($event -eq 'push' -and $ref -like 'refs/tags/*') {
+              $tag = $ref -replace '^refs/tags/', ''
+          }
+          elseif ($input -and $input.Trim() -ne '') {
+              $tag = $input.Trim()
+          }
+          else {
+              $tag = "v1.0.${{ github.run_number }}"
+          }
+          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+
+          $sha  = "${{ github.sha }}".Substring(0, 7)
+          $time = (Get-Date).ToUniversalTime().AddHours(8).ToString('yyyy-MM-dd HH:mm:ss') + ' (UTC+8)'
+
+          Write-Host "版本号: $tag"
+          Write-Host "提交:   $sha"
+          "tag=$tag"                               >> $env:GITHUB_OUTPUT
+          "name=$env:APP_NAME $tag"                >> $env:GITHUB_OUTPUT
+          "short_sha=$sha"                         >> $env:GITHUB_OUTPUT
+          "build_time=$time"                       >> $env:GITHUB_OUTPUT
+
+      - name: 注入版本号到脚本
+        shell: pwsh
+        run: |
+          $ver  = "${{ steps.ver.outputs.tag }}" -replace '^v', ''
+          $path = Join-Path (Get-Location) $env:ENTRY
+
+          $text = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+          $pattern = '(?m)^APP_VERSION\s*=\s*"[^"]*"'
+          if ($text -notmatch $pattern) {
+              throw "在 $env:ENTRY 中未找到 APP_VERSION 定义行，无法注入版本号"
+          }
+
+          $new = [regex]::Replace($text, $pattern, 'APP_VERSION = "' + $ver + '"')
+          [System.IO.File]::WriteAllText($path, $new, (New-Object System.Text.UTF8Encoding($false)))
+
+          $got = [regex]::Match(
+              [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8),
+              $pattern).Value
+          Write-Host "注入结果: $got"
+          if ($got -notmatch [regex]::Escape($ver)) {
+              throw "版本号注入校验失败（期望 $ver）"
+          }
+
+      - name: 打包 exe
+        shell: pwsh
+        run: |
+          pyinstaller --noconsole --onefile --clean --noupx `
+            --collect-all customtkinter `
+            --name "$env:APP_NAME" `
+            "$env:ENTRY"
+
+      - name: 校验打包产物
+        shell: pwsh
+        run: |
+          $exe = "dist/$env:APP_NAME.exe"
+          if (-not (Test-Path $exe)) {
+              throw "打包失败：未找到 $exe"
+          }
+          $size = (Get-Item $exe).Length / 1MB
+          Write-Host ("产物: {0}  ({1:N1} MB)" -f $exe, $size)
+
+      - name: 准备发布文件
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          # 发布文件名: AIReplay-<版本号>.exe
+          $asset = "release/$env:APP_NAME-${{ steps.ver.outputs.tag }}.exe"
+          Copy-Item "dist/$env:APP_NAME.exe" $asset
+          Write-Host "发布文件: $asset"
+          Get-ChildItem release | Select-Object Name, @{n='MB';e={[math]::Round($_.Length/1MB,1)}}
+
+      - name: 发布到 Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          name: ${{ steps.ver.outputs.name }}
+          target_commitish: ${{ github.sha }}
+          files: release/*.exe
+          generate_release_notes: true
+          make_latest: true
+          body: |
+            ## 自动构建产物
+
+            本 Release 由 GitHub Actions 在推送 `${{ env.ENTRY }}` 后自动构建并上传。
+
+            | 项目 | 内容 |
+            | --- | --- |
+            | 版本 | `${{ steps.ver.outputs.tag }}` |
+            | 提交 | `${{ steps.ver.outputs.short_sha }}` |
+            | 构建时间 | ${{ steps.ver.outputs.build_time }} |
+
+            **下载**
+
+            - `${{ env.APP_NAME }}-${{ steps.ver.outputs.tag }}.exe` —— 本版本可执行文件，双击即用
+
+            **使用方法**
+
+            1. 下载 `${{ env.APP_NAME }}-${{ steps.ver.outputs.tag }}.exe`，放到任意目录（建议单独建一个文件夹）
+            2. 双击运行 → 选择抓取日期 → 点击「开始抓取并处理」
+            3. 首次使用需要在弹窗中登录以获取 Token；Token 缓存在 exe 同目录的
+               `.amis_token.json`，内含凭据，请勿外传或提交到仓库
