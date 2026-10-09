@@ -1,0 +1,35 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- PyInstaller 打包产物（由 CI 生成，不入库）----
+build/
+dist/
+release/
+*.spec
+
+# ---- 本地登录 Token 缓存（含凭据，切勿提交）----
+.amis_token.json
+
+# ---- 运行输出（脚本生成的目录 / 报表）----
+replay核查/
+*.xlsx
+*.csv
+
+# ---- 运行期本地文件（含路径、错误堆栈、更新标记等，勿提交）----
+error.log
+*.log
+.aireplay_update.json
+*.part
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- 本助手工作区数据（本地记忆等）----
+.workbuddy/
