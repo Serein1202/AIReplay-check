@@ -14,6 +14,10 @@ release/
 # ---- 本地登录 Token 缓存（含凭据，切勿提交）----
 .amis_token.json
 
+# ---- 软件授权码（一机一码，含凭据，切勿提交）----
+license.key
+*.key
+
 # ---- 运行输出（脚本生成的目录 / 报表）----
 replay核查/
 *.xlsx
