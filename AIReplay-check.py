@@ -482,6 +482,10 @@ def is_dev_build():
 # 更新说明（取自发布正文）与更新失败提示里**不允许出现仓库地址**，
 # 也不允许引导用户去仓库手动下载。这里做统一兜底：即便正文里被写进了链接、
 # 托管平台名或 owner/repo 形式的标识，界面上也只会显示去掉这些痕迹后的文字。
+#
+# 另一个职责：更新说明区是**纯文本框，不会渲染 Markdown**，所以正文里的
+# `#` 标题、`**加粗**`、反引号、表格竖线等记号会原样显示成一堆符号。
+# 这里先用 md_to_plain() 把记号转成普通文字，再做地址清洗。
 _URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>()\[\]{}\"'，。；、）】]+", re.I)
 _HOST_RE = re.compile(r"\b(?:[\w.\-]*\.)?github(?:usercontent)?\.(?:com|io)\b", re.I)
 _SLUG_RE = re.compile(r"\b[\w.\-]+/[A-Za-z0-9._\-]*AIReplay[A-Za-z0-9._\-]*\b")
@@ -494,9 +498,87 @@ _GUIDE_RE = re.compile(
     re.I)
 _TRIM_CHARS = " \t\u3000，,、;；:：-—–·•/\\()（）[]【】<>\"'|`*_#~"
 
+# 构建细节行：对用户没有意义，整行丢弃（正文若仍是旧版自动生成的元信息，
+# 也不会把「GitHub Actions / CI / tag」这类字眼露给用户）。
+_META_RE = re.compile(
+    r"(?:GitHub\s*Actions|\bActions\b|由\s*CI\b|\bCI\b|自动构建|自动递增|"
+    r"历史\s*tag|Full\s*Changelog|push\s*到|Release\s*由|^提交\s*[:：])",
+    re.I)
+
+# ---------- Markdown 记号（说明区不渲染 Markdown，必须先去掉这些符号） ----------
+_FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+_HEAD_RE = re.compile(r"^\s{0,3}#{1,6}\s*")
+_QUOTE_RE = re.compile(r"^\s{0,3}>\s?")
+_RULE_RE = re.compile(r"^\s*(?:[-*_]\s*){3,}$")
+_TBL_SEP_RE = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(?:\|\s*:?-{2,}:?\s*)*\|?\s*$")
+_BULLET_RE = re.compile(r"^\s{0,3}(?:[-*+]|\u2022)\s+")
+_LINK_RE = re.compile(r"!?\[([^\]\n]*)\]\([^)\n]*\)")
+_CODE_RE = re.compile(r"`+([^`\n]*)`+")
+_BOLD_RE = re.compile(r"(\*\*|__)(?=\S)(.+?)(?<=\S)\1")
+_ITAL_RE = re.compile(r"(?<![\w*])([*_])(?=\S)([^*_\n]+?)(?<=\S)\1(?![\w*])")
+_ESC_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|>])")
+
+# 表格表头（「项目 / 内容」这类只有栏名没有信息的行）→ 整行丢弃
+_TBL_HEAD_WORDS = {"项目", "内容", "名称", "说明", "字段", "值", "项",
+                   "item", "value", "name", "key", "title", "field"}
+
+
+def _md_table_row(line):
+    """把 `| 项目 | 内容 |` 一行转成 `项目：内容` 这样的普通文字。"""
+    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+    cells = [c for c in cells if c]
+    if not cells:
+        return ""
+    if len(cells) == 2:
+        if cells[0].lower() in _TBL_HEAD_WORDS and cells[1].lower() in _TBL_HEAD_WORDS:
+            return ""                        # 纯表头（如「项目 / 内容」），没有信息量
+        return f"{cells[0]}：{cells[1]}"
+    return " · ".join(cells)
+
+
+def md_to_plain(text):
+    """把 Markdown 记号转成普通文字（只去记号，不做任何渲染）。
+
+    说明区是纯文本框，若不处理就会把 `## 标题`、`**加粗**`、表格竖线原样显示出来。
+    """
+    if not text:
+        return ""
+    out = []
+    in_fence = False
+    for raw in str(text).replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        line = raw.rstrip()
+        if _FENCE_RE.match(line):
+            in_fence = not in_fence          # 围栏行本身丢掉，内容保留
+            continue
+        stripped = line.strip()
+        if not in_fence:
+            if _RULE_RE.match(stripped) or _TBL_SEP_RE.match(line):
+                continue                     # 分隔线 / 表格分隔行：整行丢弃
+            if not stripped:
+                out.append("")               # 保留空行（段落间距）
+                continue
+            line = _QUOTE_RE.sub("", line)
+            line = _HEAD_RE.sub("", line)
+            line = _ESC_RE.sub(r"\1", line)
+            line = _LINK_RE.sub(r"\1", line)
+            line = _CODE_RE.sub(r"\1", line)
+            line = _BOLD_RE.sub(r"\2", line)
+            line = _ITAL_RE.sub(r"\2", line)
+            body = line.lstrip()
+            if body.startswith("|") and "|" in body[1:]:
+                line = _md_table_row(line)
+            else:
+                line = _BULLET_RE.sub("\u00b7 ", line)
+        out.append(line)
+    return "\n".join(out)
+
 
 def scrub_update_text(text):
-    """去掉展示用文本里的仓库痕迹（地址 / 平台名 / owner-repo 标识 / 下载引导）。
+    """把展示用文本整理成「可以直接给用户看」的纯文本。
+
+    做两件事：
+      1. md_to_plain()：去掉 Markdown 记号（说明区是纯文本框，不渲染 Markdown）；
+      2. 去掉仓库痕迹（地址 / 平台名 / owner-repo 标识 / 下载引导）与构建细节行。
 
     只作用于「给用户看的文本」，程序内部仍按原样使用原始下载地址。
     整行若只有一条链接、或去链接后只剩零星引导词，则该行直接丢弃，
@@ -505,7 +587,10 @@ def scrub_update_text(text):
     if not text:
         return ""
     out = []
-    for raw in str(text).splitlines():
+    blank = False                              # 上一行是空行 → 下一条正文前补一个空行
+    for raw in md_to_plain(text).splitlines():
+        if _META_RE.search(raw):
+            continue                           # 构建细节行：整行不展示
         hit = bool(_URL_RE.search(raw) or _HOST_RE.search(raw) or _SLUG_RE.search(raw))
         line = _URL_RE.sub("", raw)
         line = _HOST_RE.sub("", line)
@@ -517,13 +602,19 @@ def scrub_update_text(text):
             line = line.strip().strip(_TRIM_CHARS).strip()
         else:
             line = line.strip()
-        if not line:
-            continue
         # 含过链接的行，若剥掉链接后只剩零星几个字（如「详见」），整行丢弃
         if hit and len(re.sub(r"[\W_]+", "", line)) <= 4:
+            line = ""
+        if not line:
+            blank = True                       # 空行只记标志，避免连续空行
             continue
+        if blank and out:
+            out.append("")                     # 段落之间保留一个空行，读起来不挤
+        blank = False
         out.append(line)
-    return "\n".join(out).strip()
+    while out and not out[-1]:
+        out.pop()
+    return "\n".join(out)
 
 
 def check_for_update():

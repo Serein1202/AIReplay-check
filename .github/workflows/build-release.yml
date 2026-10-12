@@ -260,25 +260,20 @@ jobs:
           generate_release_notes: false
           make_latest: true
           # 正文 = 程序内「更新说明」的原文，因此这里只写面向用户的内容：
-          # 不出现平台名、仓库地址、tag/Release 等术语，也不引导用户手动下载。
+          #   · 不使用任何 Markdown 记号（# 标题 / ** 加粗 / 反引号 / 表格竖线）——
+          #     程序内的说明区是纯文本框，不渲染 Markdown，写了只会显示成一堆符号；
+          #   · 不出现平台名、仓库地址、tag/Release 等术语，也不引导用户手动下载。
           body: |
-            ## 自动构建产物
+            版本：${{ steps.ver.outputs.tag }}
+            构建时间：${{ steps.ver.outputs.build_time }}
 
-            本 Release 由 GitHub Actions 在 push 到 `main` 后自动构建并上传，版本号 `${{ steps.ver.outputs.tag }}` 由 CI 依据历史 tag 自动递增得出。
+            本次更新已发布，可直接在本窗口点击「立即更新」完成升级，无需手动下载文件。
 
-            | 项目 | 内容 |
-            | --- | --- |
-            | 版本 | `${{ steps.ver.outputs.tag }}` |
-            | 提交 | `${{ steps.ver.outputs.short_sha }}` |
-            | 构建时间 | ${{ steps.ver.outputs.build_time }} |
+            升级步骤
+            1. 点击「立即更新」，等待下载完成
+            2. 程序会自动重启并切换到新版本
 
-            **下载**
-
-            - `${{ env.APP_NAME }}-${{ steps.ver.outputs.tag }}.exe` —— 本版本可执行文件，双击即用
-
-            **使用方法**
-
-            1. 下载 `${{ env.APP_NAME }}-${{ steps.ver.outputs.tag }}.exe`，放到任意目录（建议单独建一个文件夹）
-            2. 双击运行 → 选择抓取日期 → 点击「开始抓取并处理」
-            3. 首次使用需要在弹窗中登录以获取 Token；Token 缓存在 exe 同目录的
-               `.amis_token.json`，内含凭据，请勿外传或提交到仓库
+            提示
+            · 升级过程中请保持网络畅通，中途关闭窗口会取消本次升级
+            · 升级完成后，旧版本文件会在下次启动时自动清理
+            · 首次使用需要在弹出窗口中登录以获取凭据，凭据仅保存在本机，请勿外传
