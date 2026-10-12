@@ -60,13 +60,14 @@ Replay 核查一体化脚本（图形界面版）
     - 账号密码仅在本机内存中使用，不写入磁盘、日志或代码；脚本内不含任何硬编码凭据
 
 在线更新:
-  - 打开程序后自动检测 GitHub 最新 Release；发现更高版本时弹窗提示，可一键下载并重启到新版本
-  - 新版本下载到 exe 同目录，文件名与 Release 资产一致（AIReplay-<版本号>.exe）；
+  - 打开程序后自动检测最新版本；发现更高版本时弹窗提示，可一键下载并重启到新版本
+  - 新版本下载到 exe 同目录，文件名形如 AIReplay-<版本号>.exe；
     重启后由新版本自动清理旧版本文件，目录里不会堆积历史 exe
-  - 网络不可达（如无法访问 api.github.com）时静默跳过，不影响正常使用
+  - 界面（更新说明、失败提示、日志区）一律不出现仓库地址，
+    也不引导用户去外部页面手动下载；网络不可达时静默跳过，不影响正常使用
   - 关闭自动检测: 设置环境变量 AIREPLAY_NO_UPDATE=1，或把 UPDATE_AUTO_CHECK 改为 False
-  - 版本号来源: 打包时由 GitHub Actions 注入 APP_VERSION（见 build-release.yml）；
-    以源码方式运行时显示占位版本，且「立即更新」会改为打开 Releases 下载页
+  - 版本号来源: 打包时由 CI 注入 APP_VERSION（见 build-release.yml）；
+    以源码方式运行时显示占位版本，且不提供在线更新
 
 依赖:
   pip install pandas openpyxl sentry-sdk customtkinter
@@ -477,8 +478,56 @@ def is_dev_build():
     return True
 
 
+# ====================== 更新文案清洗 ======================
+# 更新说明（取自发布正文）与更新失败提示里**不允许出现仓库地址**，
+# 也不允许引导用户去仓库手动下载。这里做统一兜底：即便正文里被写进了链接、
+# 托管平台名或 owner/repo 形式的标识，界面上也只会显示去掉这些痕迹后的文字。
+_URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>()\[\]{}\"'，。；、）】]+", re.I)
+_HOST_RE = re.compile(r"\b(?:[\w.\-]*\.)?github(?:usercontent)?\.(?:com|io)\b", re.I)
+_SLUG_RE = re.compile(r"\b[\w.\-]+/[A-Za-z0-9._\-]*AIReplay[A-Za-z0-9._\-]*\b")
+# 删掉域名 / 仓库标识后可能残留的路径片段（如 "/releases"、"//releases"）
+_PATH_RE = re.compile(r"(?<![\w.\-])/[\w.\-/]*")
+_BRAND_RE = re.compile(r"\bGitHub\b", re.I)
+_GUIDE_RE = re.compile(
+    r"(?:Full\s*Changelog|Changelog|详见|参见|请见|可见|此链接|该链接|链接|"
+    r"手动下载|自行下载|重新下载|下载地址|请前往|请访问|请到|前往|访问|点击|官网)",
+    re.I)
+_TRIM_CHARS = " \t\u3000，,、;；:：-—–·•/\\()（）[]【】<>\"'|`*_#~"
+
+
+def scrub_update_text(text):
+    """去掉展示用文本里的仓库痕迹（地址 / 平台名 / owner-repo 标识 / 下载引导）。
+
+    只作用于「给用户看的文本」，程序内部仍按原样使用原始下载地址。
+    整行若只有一条链接、或去链接后只剩零星引导词，则该行直接丢弃，
+    避免界面上留下「详见」这种读不通的残句。
+    """
+    if not text:
+        return ""
+    out = []
+    for raw in str(text).splitlines():
+        hit = bool(_URL_RE.search(raw) or _HOST_RE.search(raw) or _SLUG_RE.search(raw))
+        line = _URL_RE.sub("", raw)
+        line = _HOST_RE.sub("", line)
+        line = _SLUG_RE.sub("", line)
+        line = _BRAND_RE.sub("更新服务", line)
+        if hit:
+            line = _PATH_RE.sub("", line)      # 清掉剩下的 /releases 之类路径残片
+            line = _GUIDE_RE.sub("", line)
+            line = line.strip().strip(_TRIM_CHARS).strip()
+        else:
+            line = line.strip()
+        if not line:
+            continue
+        # 含过链接的行，若剥掉链接后只剩零星几个字（如「详见」），整行丢弃
+        if hit and len(re.sub(r"[\W_]+", "", line)) <= 4:
+            continue
+        out.append(line)
+    return "\n".join(out).strip()
+
+
 def check_for_update():
-    """查询 GitHub 最新 Release。
+    """查询更新服务上的最新版本信息。
 
     返回 (status, payload)：
       ("update", info)  有可用更新。info = {version, tag, name, url, asset_name, size, notes}
@@ -497,12 +546,13 @@ def check_for_update():
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         if e.code == 404:
-            return ("error", "仓库还没有发布任何 Release")
+            return ("error", "暂时没有可用的更新信息")
         if e.code == 403:
-            return ("error", "GitHub 接口访问受限（可能是请求过于频繁），请稍后再试")
-        return ("error", f"GitHub 返回 HTTP {e.code}")
+            return ("error", "更新服务暂时不可用（请求过于频繁），请稍后再试")
+        return ("error", f"更新服务返回异常（HTTP {e.code}）")
     except Exception as e:
-        return ("error", f"无法访问 GitHub（{type(e).__name__}: {e}）")
+        # 只保留异常类型，不把可能含 URL 的异常原文带到界面上
+        return ("error", f"网络异常，暂时无法获取更新信息（{type(e).__name__}）")
 
     tag = (data.get("tag_name") or "").strip()
     assets = data.get("assets") or []
@@ -519,7 +569,7 @@ def check_for_update():
                 asset = a
                 break
     if asset is None:
-        return ("error", f"Release {tag or '(无标签)'} 中没有可用的 exe 文件")
+        return ("error", "该版本暂无可下载的更新文件")
 
     info = {
         "version": tag.lstrip("vV"),
@@ -1897,7 +1947,8 @@ if ctk is not None:
                              anchor="w").grid(row=i, column=1, sticky="w",
                                               padx=(0, 20), pady=(14 if i == 0 else 7, 0))
 
-            notes = (info.get("notes") or "").strip()
+            # 更新说明先做清洗：界面上不展示任何仓库地址 / 平台名 / 下载引导
+            notes = scrub_update_text(info.get("notes") or "")
             ctk.CTkLabel(body, text="更新说明", font=f_key, text_color=CLR["sub"]).grid(
                 row=len(rows), column=0, columnspan=2, sticky="w", padx=20, pady=(18, 4))
             txt = ctk.CTkTextbox(body, height=126, corner_radius=10, font=f_mono, wrap="word",
@@ -1960,14 +2011,10 @@ if ctk is not None:
             if self._busy:
                 return
             if not current_exe_path():
-                # 源码运行：不做自我替换，改为打开下载页
+                # 源码运行：不做自我替换；也不跳转外部页面（不引导用户去仓库取包）
                 self._busy = True
-                self.btn_go.configure(state="disabled", text="已打开下载页")
-                self.lbl_msg.configure(text="当前为源码运行，请在浏览器中手动下载新版本。")
-                try:
-                    webbrowser.open(f"https://github.com/{GITHUB_REPO}/releases/latest")
-                except Exception:
-                    pass
+                self.btn_go.configure(state="disabled", text="无法自动更新")
+                self.lbl_msg.configure(text="当前为源码运行，暂不支持在线更新。")
                 return
             self._busy = True
             self.btn_go.configure(state="disabled", text="正在下载…")
@@ -2000,6 +2047,8 @@ if ctk is not None:
 
         def _on_error(self, msg):
             self._busy = False
+            # 失败原因也过一遍清洗：日志区、状态行与弹窗里都不出现仓库地址 / 下载引导
+            msg = scrub_update_text(msg) or "下载未完成"
             try:
                 self.btn_go.configure(state="normal", text="重试")
                 self.btn_later.configure(state="normal")
@@ -2010,7 +2059,7 @@ if ctk is not None:
                 import tkinter.messagebox as mb
                 mb.showerror("更新失败",
                              f"下载新版本失败：\n\n{msg}\n\n"
-                             f"可前往 https://github.com/{GITHUB_REPO}/releases 手动下载。")
+                             "请检查网络后点击「重试」，或稍后再试。")
             except Exception:
                 pass
 

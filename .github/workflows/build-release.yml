@@ -255,8 +255,12 @@ jobs:
           name: ${{ steps.ver.outputs.name }}
           target_commitish: ${{ github.sha }}
           files: release/*.exe
-          generate_release_notes: true
+          # ⚠️ 必须保持 false：开启后平台会自动往正文追加一条「Full Changelog」对比链接，
+          #    而正文会**原样显示在程序内的「更新说明」里**，等于把仓库地址暴露给用户。
+          generate_release_notes: false
           make_latest: true
+          # 正文 = 程序内「更新说明」的原文，因此这里只写面向用户的内容：
+          # 不出现平台名、仓库地址、tag/Release 等术语，也不引导用户手动下载。
           body: |
             ## 自动构建产物
 
