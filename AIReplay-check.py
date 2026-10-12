@@ -17,21 +17,24 @@ Replay 核查一体化脚本（图形界面版）
   python AIReplay-check.py --selfcheck      # 界面自检（启动后自动退出）
   python AIReplay-check.py --check-update   # 只检测更新并打印结果（不启动界面）
   python AIReplay-check.py --version        # 打印当前版本号
-  python AIReplay-check.py --license        # 在命令行查看授权状态（排障用，界面不展示）
 
 软件授权（License Guard）:
   - 由自建授权服务签发令牌，客户端仅做验签，校验全程在后台进行
-  - 界面（含日志区、状态栏、按钮）不显示任何授权相关信息
+  - **不露痕迹（硬性要求，用户明确要求）**：任何情况下都不能让人看出软件带授权 ——
+      · 界面（日志区 / 状态栏 / 按钮）不显示任何授权信息
+      · 任何情况下都不弹授权对话框（即使后台把「到期时的行为」设成「弹提示后退出」）
+      · **命令行也零输出**：没有 --license 之类的子命令，校验失败不打印任何字样
+      · 诊断信息默认全部丢弃；排障时设 AIREPLAY_LICENSE_TRACE=<文件路径> 才写盘
   - 授权码已内置在脚本里，无需额外的 license.key 文件
     （如需按客户分发不同授权码，优先级为：环境变量 LICENSE_KEY >
       程序同目录 license.key > 脚本内置 LICENSE_KEY）
-  - **策略完全跟随后台设置**，客户端不自行揣测：
-      到期时的行为（硬闪退 / 弹提示后退出）、心跳间隔、断网容忍天数、
-      到期后宽限、设备数上限、令牌有效期 全部由后台下发并原样执行
+  - 其余策略完全跟随后台设置，客户端不自行揣测：
+      心跳间隔、断网容忍天数、到期后宽限、设备数上限、令牌有效期
+      全部由后台下发并原样执行（后台的「到期时的行为」仅保留退出码效果）
   - 每次启动都联网校验（LICENSE_ONLINE_CHECK_SEC = 0），后台改吊销 / 过期立刻生效；
     只有连不上服务器时才按后台的「断网容忍天数」离线放行
   - 命令行模式与降级弹窗模式同样要过校验，不存在绕过路径
-  - 失败原因只打到 stdout（exe 为 --noconsole，界面看不到任何痕迹）
+  - 失败只体现为「进程退出码」，不产生任何文字 / 对话框
 
 登录态说明:
   获取顺序（优先级由高到低）:
@@ -155,6 +158,12 @@ FONT_UI = "Microsoft YaHei UI"
 # ====================== 版本与在线更新 ======================
 # 当前版本号：仓库源码里保留占位值，打包时由 GitHub Actions 注入该次发布的真实版本号
 # （见 .github/workflows/build-release.yml 的「注入版本号」步骤）
+#
+# ⚠️ 发布方式（方案 B）：**push 到 main 就自动发版**，版本号由 CI 自动算。
+#     git push            # 就这一步
+#   CI 取历史最高 tag，patch 位 +1（如 v1.0.2 → v1.0.3），自动打 tag 并发布 Release。
+#   号完全由历史 tag 推算，天然单调递增；CI 还会做一次倒序保护校验。
+#   何时需要手动打 tag：只在「想指定某个特定版本号」时才需要，平时不用管。
 APP_VERSION = "0.0.0"
 APP_VERSION_PLACEHOLDER = "0.0.0"
 
@@ -221,6 +230,27 @@ except Exception as _e:  # Sentry 不可用不影响主流程
     except Exception:
         pass
 
+def _license_trace(msg):
+    """授权诊断输出 —— **默认什么都不输出**。
+
+    用户硬性要求：任何情况下都不能让人看出这个软件设置了授权。
+    因此这里既不 print、也不弹窗、也不写程序目录，默认完全是空操作。
+
+    需要排障时，提前设一个环境变量即可把诊断写进文件（注意：别用 stdout，
+    否则从终端启动时会被终端 / 调度器日志捕获）：
+
+        set AIREPLAY_LICENSE_TRACE=D:\tmp\aireplay_license.log
+    """
+    path = os.environ.get("AIREPLAY_LICENSE_TRACE")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+    except Exception:
+        pass
+
+
 # ---- 授权 SDK（随程序一起分发，零第三方依赖；缺失时降级为「不校验」）----
 try:
     import license_guard
@@ -229,7 +259,7 @@ except Exception as _le:
     license_guard = None
     _LICENSE_SDK_OK = False
     try:
-        print(f"[警告] 授权模块 license_guard 不可用: {_le}", flush=True)
+        _license_trace(f"授权模块 license_guard 不可用: {_le}")
     except Exception:
         pass
 
@@ -427,6 +457,24 @@ def version_is_newer(latest, current):
     a, b = _version_key(latest), _version_key(current)
     n = max(len(a), len(b))
     return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
+
+
+def is_dev_build():
+    """当前是不是「本地开发/自测构建」——版本号识别不出来（仍为占位值）时算开发版。
+
+    为什么要单独判断：源码方式运行、或本地 PyInstaller 打出来的包（如 AIReplay-local.exe）
+    名称里不带版本号，current_app_version() 只能回落到 0.0.0。
+    这种包拿去和线上 Release 比，永远判「有新版本」，每次启动都弹更新框，
+    纯属噪音。因此开发构建直接跳过自动更新检查。
+    """
+    v = (APP_VERSION or "").strip().lstrip("vV")
+    if v and v != APP_VERSION_PLACEHOLDER:
+        return False
+    if getattr(sys, "frozen", False):
+        if re.search(r"AIReplay[-_]?v?(\d+(?:\.\d+)*)",
+                     os.path.basename(sys.executable), re.I):
+            return False
+    return True
 
 
 def check_for_update():
@@ -700,6 +748,7 @@ def create_license_guard(on_denied=None):
             online_check_interval_sec=LICENSE_ONLINE_CHECK_SEC,  # 0 = 每次校验都联网
             fail_mode=LICENSE_FAIL_MODE,   # 兜底默认；成功后端策略会覆盖它
             exit_code=LICENSE_EXIT_CODE,   # 同上
+            allow_dialog=False,            # 🚫 铁律：SDK 不得自己弹任何授权对话框
             on_denied=on_denied,
         )
         return license_guard.LicenseGuard(cfg)
@@ -710,15 +759,17 @@ def create_license_guard(on_denied=None):
 def license_fail_behavior(guard=None):
     """返回校验失败时该怎么做：(是否弹提示, 退出码)
 
-    **完全跟随后端设置**：后台「到期时的行为」= 直接闪退 / 弹提示后退出，
-    以及它下发的 exit_code，都会被 SDK 采纳到 guard.cfg 上，这里只负责读出来。
-    只有后端够不着（本地联不上服务器、策略拉取失败）时才用本地兜底默认值。
+    **本程序永不弹授权提示。** 用户要求「不管什么情况都不要出现授权码相关提示，
+    不希望别人知道软件设置了授权」，因此第一个返回值恒定是 False ——
+    即便后台把「到期时的行为」设成「弹提示后退出」，界面上也不会出现任何对话框，
+    该旋钮对界面彻底失效（后台那边仍可留着，不影响）。
+
+    退出码依旧跟随后端下发的 exit_code，方便运维 / 定时任务统计退出原因。
     """
     cfg = getattr(guard, "cfg", None)
-    mode = getattr(cfg, "fail_mode", None) or LICENSE_FAIL_MODE
     code = getattr(cfg, "exit_code", None)
     exit_code = code if isinstance(code, int) and code > 0 else (LICENSE_EXIT_CODE or 1)
-    return (mode == "message"), exit_code
+    return False, exit_code
 
 
 def verify_license(on_denied=None):
@@ -749,7 +800,9 @@ def enforce_license_cli():
     """命令行 / 降级弹窗路径的授权校验（图形界面模式另有自己的后台校验线程）。
 
     返回 0 表示通过；非 0 为应返回给系统的退出码（跟随后端下发的 exit_code）。
-    命令行不是「软件界面」，因此失败原因会打到控制台，方便定位问题。
+    **全程零输出**：以前会把失败原因打到控制台，但 exe 从终端启动时
+    终端会看到这些字样，等于暴露「软件带授权」。现在只留退出码，
+    需要看原因请设 AIREPLAY_LICENSE_TRACE 环境变量（见 _license_trace）。
     """
     if not LICENSE_ENABLED:
         return 0
@@ -766,26 +819,8 @@ def enforce_license_cli():
                 pass
         return 0
     code, msg = payload
-    _console(f"[授权] 校验未通过（{code}）：{msg}")
+    _license_trace(f"命令行校验未通过（{code}）：{msg}")
     return license_fail_behavior(guard)[1]
-
-
-def license_detail_lines(info, key_source=""):
-    """生成多行授权详情（仅供控制台 / 排障使用，界面不展示）"""
-    if info is None:
-        return ["授权校验已关闭"]
-    fmt = lambda v: time.strftime("%Y-%m-%d %H:%M", time.localtime(int(v))) if v else "-"  # noqa: E731
-    return [
-        f"客户      : {info.customer or '未署名'}",
-        f"状态      : {info.status}{'（离线判定）' if info.offline else ''}",
-        f"功能开关  : {', '.join(info.features) if info.features else '无'}",
-        f"名义到期  : {fmt(info.expires_at)}",
-        f"硬到期    : {fmt(info.hard_expires_at)}",
-        f"剩余天数  : {info.days_left() if info.hard_expires_at else '永久'}",
-        f"设备上限  : {info.max_devices}（已用 {info.activations}）",
-        f"授权码来源: {key_source or '-'}",
-        f"本机指纹  : {license_guard.machine_id() if _LICENSE_SDK_OK else '-'}",
-    ]
 
 
 # ---------------------------------------------------------------- 登录 Token
@@ -2290,7 +2325,7 @@ if ctk is not None:
             if not LICENSE_ENABLED:
                 self._license_ok = True
                 self._license_pending = False
-                _console("[授权] 已按配置跳过授权校验")
+                _license_trace("已按配置跳过授权校验")
                 self._reveal_for_license()
                 self._schedule_update_check()
                 return
@@ -2331,7 +2366,7 @@ if ctk is not None:
                 tail = "永久有效"
             if info is not None and info.offline:
                 tail += "（本次为离线判定）"
-            _console(f"[授权] 校验通过：{who} · {tail}")
+            _license_trace(f"校验通过：{who} · {tail}")
 
             self._start_license_watchdog()
 
@@ -2348,17 +2383,12 @@ if ctk is not None:
             self._license_ok = False
             self._license_pending = False
             self._pending_day = None
-            # 弹不弹提示、用哪个退出码，完全跟随后台「到期时的行为」/ exit_code
-            show_prompt, exit_code = license_fail_behavior(self._license_guard)
-            _console(f"[授权] 校验未通过: [{code}] {msg}"
-                     f"（后台设定：{'弹提示后退出' if show_prompt else '直接闪退'}，退出码 {exit_code}）")
-            if show_prompt:
-                try:
-                    import tkinter.messagebox as mb
-                    mb.showerror("无法启动",
-                                 f"程序无法启动，已退出。\n\n{msg}\n\n（错误代码：{code}）")
-                except Exception:
-                    pass
+            # 🚫 铁律：任何情况下都不弹授权提示。
+            # 即便后台把「到期时的行为」设成「弹提示后退出」，本程序也一律静默退出，
+            # 失败只体现为退出码（否则用户一眼就能看出软件带授权）。
+            _, exit_code = license_fail_behavior(self._license_guard)
+            _license_trace(f"校验未通过: [{code}] {msg}"
+                           f"（静默退出，退出码 {exit_code}）")
             # 未通过校验就不进入主界面
             self.after(200, lambda: _exit_now(exit_code))
 
@@ -2386,8 +2416,18 @@ if ctk is not None:
             刻意不放在 __init__ 里：更新弹窗是个独立顶层窗口，不受主窗口 withdraw()
             影响，若在授权校验出结果前弹出，就会在「本应无任何界面」的启动期露脸。
             因此统一在**授权通过**（或授权被关闭）之后才发起。
+
+            开发构建（版本号仍是 0.0.0，即源码运行或本地自测包）直接跳过：
+            否则它永远比线上版本"旧"，每次启动都弹更新框，纯噪音。
+            手动点「检查更新」不受此限制（见 _check_update(manual=True)）。
             """
             if not UPDATE_AUTO_CHECK or os.environ.get("AIREPLAY_NO_UPDATE"):
+                return
+            if is_dev_build():
+                # 本地自测包（如 AIReplay-local.exe）版本号未注入，算 0.0.0，
+                # 若放行会永远提示「发现新版本」。启动期直接跳过；
+                # 用户手动点「检查更新」不受影响。
+                _license_trace("开发构建（版本号未注入），跳过自动更新检查")
                 return
             self.after(1200, lambda: self._check_update(manual=False))
 
@@ -2544,7 +2584,7 @@ if ctk is not None:
 # ==================================================================
 def _parse_args(argv):
     """返回 (day, selfcheck, action)；
-    day 为 YYYYMMDD 或 None，action ∈ {None, "check_update", "version", "license"}"""
+    day 为 YYYYMMDD 或 None，action ∈ {None, "check_update", "version"}"""
     day, selfcheck, action, rest = None, False, None, []
     i = 0
     while i < len(argv):
@@ -2555,8 +2595,6 @@ def _parse_args(argv):
             action = "check_update"
         elif a in ("--version", "-V"):
             action = "version"
-        elif a in ("--license", "-L"):
-            action = "license"
         elif a in ("--cli", "--date", "-d"):
             i += 1
             if i < len(argv):
@@ -2589,28 +2627,9 @@ def main():
         _console(current_app_version())
         return 0
 
-    # --license：在命令行查看授权状态（排障用；界面依旧不展示任何授权信息）
-    if action == "license":
-        if not LICENSE_ENABLED:
-            _console("授权校验已关闭（LICENSE_ENABLED = False）")
-            return 0
-        if not _LICENSE_SDK_OK:
-            _console("授权模块 license_guard.py 不可用")
-            return 1
-        key, src = resolve_license_key()
-        if not key:
-            _console("未找到授权码（内置为空，且无环境变量 LICENSE_KEY / 同目录 license.key）")
-            return 1
-        denied = {}
-        ok, payload, _guard = verify_license(
-            on_denied=lambda c, m: denied.update(code=c, message=m))
-        if ok:
-            for line in license_detail_lines(payload, src):
-                _console(line)
-            return 0
-        code, msg = payload
-        _console(f"校验未通过: [{code}] {msg}")
-        return 1
+    # 注意：以前这里有个 --license 子命令，会在控制台打印授权状态。
+    # 用户要求「任何情况下都不能让人看出软件带授权」，该子命令已删除。
+    # 排障需要看授权结果时，设环境变量 AIREPLAY_LICENSE_TRACE=<文件路径>。
 
     # --check-update：只检测更新并打印结果，不启动界面
     if action == "check_update":

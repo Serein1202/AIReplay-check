@@ -1,25 +1,33 @@
 name: Build EXE & Publish Release
 
 # ── 触发条件 ───────────────────────────────────────────────────────
-# 1) 向 main / master 推送，且改动包含 .py 文件
-#      → 自动构建 exe 并发布 Release，版本号自动递增（v1.0.<构建号>）
-# 2) 推送 tag（如 git tag v1.2.0 && git push origin v1.2.0）
-#      → 以该 tag 作为版本号构建并发布 Release
-# 3) 在 GitHub 仓库 Actions 页面手动 Run workflow
-#      → 可自定义版本号，留空则自动生成
+# 发版方式（方案 B）：**push 到 main 就自动发版**，版本号由 CI 自动计算。
+#
+#   git push                # 就这一步，CI 自己算号、打包、发 Release
+#
+# 版本号怎么算：取仓库里**最高的已有 tag**，patch 位 +1，然后由 CI 自动打 tag。
+#   例：历史最高 v1.0.2  →  本次自动发 v1.0.3，并自动 push 该 tag
+#   首次（无任何 tag）  →  从 v1.0.1 起步
+#
+# 为什么不再用 `github.run_number`：
+#   它是「本 workflow 的第几次运行」——重跑不 +1，但打 tag 会 +1，与版本语义无关。
+#   混用会出现「自动生成的版本号比上一个 tag 低」，导致：
+#     · releases/latest 与版本号语义错乱
+#     · 老用户版本号更大，version_is_newer() 判定「无更新」→ 更新链断掉
+#   现在的号完全由历史 tag 推算，天然单调递增，且 CI 仍会做一次递增保护校验。
+#
+# 注 1：读版本号用「历史最高的 tag」（而不是 releases/latest），这样即使某次构建失败
+#       没发出 Release，下次也不会重复用同一个号（tag 已推，号已占）。
+# 注 2：workflow_dispatch 仅用于「重发某个 tag」或验证打包流程；
+#       留空 = 取最新已有 tag 原样重发，不会 +1。
 on:
   push:
-    branches: [main, master]
-    paths:
-      - '**/*.py'
-      - 'requirements.txt'
-      - '.github/workflows/build-release.yml'
-    tags:
-      - 'v*'
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号（如 v1.2.0；留空则自动生成 v1.0.<构建号>）'
+        description: '留空 = 重发最新已有 tag；填已存在的 tag（如 v1.0.3）= 重发该版本'
         required: false
         default: ''
 
@@ -58,7 +66,7 @@ jobs:
           # 锁死打包器版本：与本地验证过的版本一致，避免 PyInstaller 升级导致产物行为漂移
           pip install pyinstaller==6.22.3
 
-      - name: 计算版本号
+      - name: 计算版本号（取历史最高 tag，patch +1）
         id: ver
         shell: pwsh
         run: |
@@ -66,16 +74,53 @@ jobs:
           $event = "${{ github.event_name }}"
           $input = "${{ github.event.inputs.version }}"
 
-          if ($event -eq 'push' -and $ref -like 'refs/tags/*') {
-              $tag = $ref -replace '^refs/tags/', ''
+          # 版本号比较用：把 v1.2.3 归一成可数值比较的 4 段键
+          function ToKey([string]$v) {
+              $n = ([regex]::Matches(($v -replace '^v',''), '\d+') | ForEach-Object { [int]$_.Value })
+              $a = @($n)
+              while ($a.Count -lt 4) { $a += 0 }
+              return ($a[0..3] -join '.')
           }
-          elseif ($input -and $input.Trim() -ne '') {
+
+          git fetch --tags --quiet
+          $allTags = @(git tag --list 'v*' | Where-Object { ($_ -replace '^v','') -match '^\d+(\.\d+){1,3}$' })
+
+          if ($input -and $input.Trim() -ne '') {
+              # ── 手动指定：重发某个已存在的 tag ──
               $tag = $input.Trim()
+              if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+              git rev-parse -q --verify "refs/tags/$tag" | Out-Null
+              if ($LASTEXITCODE -ne 0) {
+                  throw "tag '$tag' 不存在。重发请填一个已存在的 tag。"
+              }
+              $ver = $tag -replace '^v',''
+              "action=reuse" >> $env:GITHUB_OUTPUT
+              Write-Host "手动重发模式：$tag"
+          }
+          elseif ($allTags.Count -eq 0) {
+              # ── 仓库里还没有任何 tag：从 v1.0.1 起步 ──
+              $tag = 'v1.0.1'
+              $ver = '1.0.1'
+              "action=create" >> $env:GITHUB_OUTPUT
+              Write-Host "首次发版（无历史 tag）：$tag"
           }
           else {
-              $tag = "v1.0.${{ github.run_number }}"
+              # ── 取历史最高的 tag，patch 位 +1（只在最后一段进 1），然后自动打 tag ──
+              $maxTag = $allTags | Sort-Object { ToKey $_ } -Descending | Select-Object -First 1
+              $parts  = @(($maxTag -replace '^v','') -split '\.')
+              # 补足到 3 段（如 v1.0 → 1.0.0）
+              while ($parts.Count -lt 3) { $parts += '0' }
+              $parts[$parts.Count - 1] = ([int]$parts[$parts.Count - 1] + 1).ToString()
+              $ver = $parts -join '.'
+              $tag = "v$ver"
+              "action=create" >> $env:GITHUB_OUTPUT
+              Write-Host "自动递增：$maxTag → $tag"
           }
-          if (-not $tag.StartsWith('v')) { $tag = "v$tag" }
+
+          # 格式兜底（只允许数字和点）
+          if ($ver -notmatch '^\d+(\.\d+){1,3}$') {
+              throw "版本号 '$tag' 不合法。期望形如 v1.2.3（数字和点）。"
+          }
 
           $sha  = "${{ github.sha }}".Substring(0, 7)
           $time = (Get-Date).ToUniversalTime().AddHours(8).ToString('yyyy-MM-dd HH:mm:ss') + ' (UTC+8)'
@@ -84,8 +129,73 @@ jobs:
           Write-Host "提交:   $sha"
           "tag=$tag"                               >> $env:GITHUB_OUTPUT
           "name=$env:APP_NAME $tag"                >> $env:GITHUB_OUTPUT
+          "ver=$ver"                               >> $env:GITHUB_OUTPUT
           "short_sha=$sha"                         >> $env:GITHUB_OUTPUT
           "build_time=$time"                       >> $env:GITHUB_OUTPUT
+
+      - name: 版本号递增保护（不许重号 / 倒序）
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # 目标：确保本次版本号 > 历史所有已发布版本号。
+          # 版本号一旦倒序，老用户的 number 更大，程序会判定「无更新」，更新链就断了。
+          # ⚠️ 本步骤刻意排在「自动打 tag」之前：万一校验不过，远端不会被留下一个坏 tag。
+          $ver = "${{ steps.ver.outputs.ver }}"
+
+          # 重发模式：同一个 tag 再发一次是允许的，不做递增校验
+          if ("${{ steps.ver.outputs.action }}" -eq 'reuse') {
+              Write-Host "重发模式（tag 已存在），跳过递增校验。"
+              exit 0
+          }
+
+          # 取历史所有 Release 的 tag，找出最大的版本号
+          $tags = gh release list --limit 100 --json tagName --jq '.[].tagName' 2>$null
+
+          function ToKey([string]$v) {
+              $n = ([regex]::Matches(($v -replace '^v',''), '\d+') | ForEach-Object { [int]$_.Value })
+              $a = @($n)
+              while ($a.Count -lt 4) { $a += 0 }
+              return ($a[0..3] -join '.')
+          }
+
+          $thisKey = ToKey $ver
+
+          # 历史最高 = Release 里的最高 ∪ 所有已存在的 tag
+          # （本次 tag 此时尚未推送，候选集天然不含自身，因此可以用严格的大于比较）
+          $allTags = @(git tag --list 'v*' | Where-Object { ($_ -replace '^v','') -match '^\d+(\.\d+){1,3}$' })
+          $cands = @($tags) + @($allTags) | Where-Object { $_ -and ($_ -ne "${{ steps.ver.outputs.tag }}") }
+          if ($cands.Count -eq 0) {
+              Write-Host "无历史版本，跳过递增校验。"
+              exit 0
+          }
+
+          $maxTag = ($cands | Sort-Object { ToKey $_ } -Descending | Select-Object -First 1)
+          $maxKey = ToKey $maxTag
+
+          Write-Host "本次: v$ver ($thisKey)   历史最高: $maxTag ($maxKey)"
+          if ([version]$thisKey -le [version]$maxKey) {
+              throw "版本号未递增：本次 v$ver 不大于历史最高 $maxTag。请检查是否手工打了一个低版本 tag。"
+          }
+          Write-Host "递增校验通过。"
+
+      - name: 自动打 tag（仅自动递增时）
+        if: steps.ver.outputs.action == 'create'
+        shell: pwsh
+        run: |
+          # 号一旦推出就占用，避免下次构建重复用同一个号。
+          # 幂等：若 tag 已存在（例如上次构建失败后重跑），直接复用，不报错。
+          $tag = "${{ steps.ver.outputs.tag }}"
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+              git push origin $tag
+              if ($LASTEXITCODE -ne 0) { throw "推送 tag $tag 失败" }
+              Write-Host "已自动推送 tag: $tag"
+          } else {
+              Write-Host "tag $tag 已存在，跳过创建（复用）。"
+          }
 
       - name: 注入版本号到脚本
         shell: pwsh
@@ -150,7 +260,7 @@ jobs:
           body: |
             ## 自动构建产物
 
-            本 Release 由 GitHub Actions 在推送 `${{ env.ENTRY }}` 后自动构建并上传。
+            本 Release 由 GitHub Actions 在 push 到 `main` 后自动构建并上传，版本号 `${{ steps.ver.outputs.tag }}` 由 CI 依据历史 tag 自动递增得出。
 
             | 项目 | 内容 |
             | --- | --- |

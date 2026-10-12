@@ -63,7 +63,7 @@ __all__ = [
     "ecdsa_p256_verify",
 ]
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -312,6 +312,11 @@ class GuardConfig:
     storage_dir: Optional[str] = None
     on_denied: Optional[Callable[[str, str], None]] = None
     """自定义拒绝回调 (code, message) -> None；设了它就不会自动退出"""
+
+    allow_dialog: bool = True
+    """允许 SDK 自己弹系统对话框吗（仅 fail_mode="message" 且未设 on_denied 时才有意义）。
+    调用方若要求「任何情况下都不得出现授权相关提示」，传 False，
+    此时 message 模式会退化成静默退出（连 stderr 也不写），一切提示由调用方自己决定。"""
 
     debug: bool = False
 
@@ -803,7 +808,8 @@ class LicenseGuard:
         if self.cfg.on_denied:
             self.cfg.on_denied(code, message)
             raise LicenseError(code, message)
-        _terminate(self.cfg.fail_mode, self.cfg.exit_code, message, code)
+        _terminate(self.cfg.fail_mode, self.cfg.exit_code, message, code,
+                   self.cfg.allow_dialog)
 
     # ----------------------------------------------------- 公开 API
     def authorize(self) -> LicenseInfo:
@@ -813,7 +819,8 @@ class LicenseGuard:
         except LicenseError as e:
             if self.cfg.on_denied:
                 raise
-            _terminate(self.cfg.fail_mode, self.cfg.exit_code, e.message, e.code)
+            _terminate(self.cfg.fail_mode, self.cfg.exit_code, e.message, e.code,
+                       self.cfg.allow_dialog)
             raise  # 理论上到不了
 
     def start_watchdog(self) -> None:
@@ -844,7 +851,8 @@ class LicenseGuard:
                             pass
                         self._stop.wait(600)
                         continue
-                    _terminate(self.cfg.fail_mode, self.cfg.exit_code, e.message, e.code)
+                    _terminate(self.cfg.fail_mode, self.cfg.exit_code, e.message, e.code,
+                               self.cfg.allow_dialog)
 
         self._watchdog = threading.Thread(target=loop, name="license-guard-watchdog", daemon=True)
         self._watchdog.start()
@@ -917,11 +925,15 @@ def _app_version() -> str:
 #  7. 终止策略 —— 「到期直接闪退」
 # ══════════════════════════════════════════════════════════════════
 
-def _terminate(mode: str, code: int, message: str, err_code: str) -> None:
+def _terminate(mode: str, code: int, message: str, err_code: str,
+               allow_dialog: bool = True) -> None:
     """
     hard    : 不走 Python 清理流程，直接终止进程 —— 表现就是「闪退」。
     message : 输出一行提示后退出。
     两者都保证：代码执行不到后面的业务逻辑。
+
+    allow_dialog=False：连 message 模式的 stderr 提示与系统对话框都跳过，
+    直接静默退出。供「不得暴露授权存在」的宿主程序使用。
     """
     try:
         sys.stdout.flush()
@@ -929,7 +941,7 @@ def _terminate(mode: str, code: int, message: str, err_code: str) -> None:
     except Exception:
         pass
 
-    if mode == "message":
+    if mode == "message" and allow_dialog:
         banner = "!" * 58
         try:
             sys.stderr.write(
@@ -942,7 +954,7 @@ def _terminate(mode: str, code: int, message: str, err_code: str) -> None:
         _try_dialog(message)
         os._exit(code)
 
-    # hard：不打印堆栈、不触发 atexit，直接走
+    # hard（或调用方禁止任何提示）：不打印堆栈、不触发 atexit，直接走
     os._exit(code)
 
 
