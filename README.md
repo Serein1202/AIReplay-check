@@ -15,9 +15,10 @@ Replay 核查一体化工具：一次运行完成「后台抓取 → CSV 导出 
 程序内置授权校验（License Guard）。**核心原则：相关参数完全跟随后台设置**，
 客户端不自己揣测策略，后台改完即生效。
 
-- **授权码已内置在程序里**，开箱即用，无需额外配置文件
-  （按客户分发要不同授权码时，覆盖优先级：环境变量 `LICENSE_KEY` >
-  程序同目录的 `license.key` > 内置授权码）
+- **授权码不打进仓库**：仓库里 `LICENSE_KEY` 是空的，正式构建时由 CI 从仓库 Secret
+  `APP_LICENSE_KEY` 注入后再打包 —— 这样公开仓库和 git 历史里都查不到授权码，
+  换码也只需改 Secret 重跑构建，不必改代码。运行时的覆盖优先级：
+  环境变量 `LICENSE_KEY` > 程序同目录的 `license.key` > 脚本内置值
 - **每次启动都会联网校验**（`LICENSE_ONLINE_CHECK_SEC = 0`），因此后台把授权码改成
   过期 / 吊销 / 暂停，客户端下次启动立刻被拦下（此前版本会被本地缓存令牌「离线放行」挡掉）
 - 以下参数由后台下发，客户端原样执行：
@@ -60,41 +61,55 @@ Replay 核查一体化工具：一次运行完成「后台抓取 → CSV 导出 
 
 | 操作 | 结果 |
 | --- | --- |
-| 向 `main` 分支推送含 `.py` 的改动 | 自动构建，版本号自动递增为 `v1.0.<构建号>`，生成 Release |
-| `git tag v1.2.0 && git push origin v1.2.0` | 以 `v1.2.0` 作为版本号构建并发布 |
-| 在 Actions 页面点 **Run workflow** | 手动触发，可自定义版本号（留空则自动生成） |
+| 向 `main` 分支推送提交 | 自动构建，版本号取历史最高 tag 的 patch +1（如 v1.0.2 → v1.0.3），自动打 tag 并发布 |
+| 在 Actions 页面点 **Run workflow** | 留空 = 重发最新已有 tag（不 +1）；填某个已存在的 tag = 重发该版本 |
 
-每次发布会生成一个可执行文件 `AIReplay-<版本号>.exe`（例如 `AIReplay-v1.0.1.exe`）。
+每次发布会生成一个可执行文件 `AIReplay-<版本号>.exe`（例如 `AIReplay-v1.0.3.exe`）。
+
+⚠️ 需要在仓库 **Settings → Secrets and variables → Actions** 里配置一个 Secret：
+
+| Secret | 说明 |
+| --- | --- |
+| `APP_LICENSE_KEY` | 内置授权码（形如 `XXXX-XXXX-XXXX-XXXX`）。打包前注入脚本，注入失败会直接让构建失败，不会发出「没有授权码」的 exe |
 
 流程配置见 [`.github/workflows/build-release.yml`](.github/workflows/build-release.yml)：
 
 ```
-检出代码 → 安装 Python 3.12 → 安装依赖 → 计算版本号
-        → 注入版本号到脚本 → PyInstaller 打包 → 校验产物 → 挂载到 Release
+检出代码 → 安装 Python 3.12 → 安装依赖 → 计算版本号 → 递增保护 → 自动打 tag
+        → 注入版本号到脚本 → 注入授权码到脚本 → PyInstaller 打包 → 校验产物 → 挂载到 Release
 ```
 
 > 打包前会把计算出的版本号写入脚本的 `APP_VERSION`，所以每个 exe 都确切知道自己是哪个版本 —— 这是自动更新判断「是否需要升级」的依据。
+> 注入只发生在 CI 的运行目录里，不会提交回仓库。
 
 ## 本地开发
+
+> 授权码不在仓库里，本地运行需先提供：设置环境变量 `LICENSE_KEY`，或在本目录放一个
+> `license.key`（内容即授权码，已在 `.gitignore` 中忽略）。
 
 ```bash
 pip install -r requirements.txt
 
-python AIReplay-check.py                  # 打开图形界面
-python AIReplay-check.py 20260924         # 静默模式（可用于定时任务）
-python AIReplay-check.py --selfcheck      # 界面自检
-python AIReplay-check.py --check-update   # 只检测更新并打印结果
-python AIReplay-check.py --version        # 打印当前版本号
+export LICENSE_KEY=XXXX-XXXX-XXXX-XXXX       # 或写一份 license.key
+python AIReplay-check.py                     # 打开图形界面
+python AIReplay-check.py 20260924            # 静默模式（可用于定时任务）
+python AIReplay-check.py --selfcheck         # 界面自检
+python AIReplay-check.py --check-update      # 只检测更新并打印结果
+python AIReplay-check.py --version           # 打印当前版本号
 ```
 
 ## 本地打包 exe
 
 ```bash
 pip install pyinstaller
+export LICENSE_KEY=XXXX-XXXX-XXXX-XXXX       # 本地打包同样要提供授权码
 pyinstaller --noconsole --onefile --clean --collect-all customtkinter --name "AIReplay" AIReplay-check.py
 ```
 
 产物位于 `dist/AIReplay.exe`。
+
+> 本地打包出来的 exe 会带上**当时环境里的**授权码；正式发布请走 CI（由 Secret 注入），
+> 避免把授权码写进本地脚本或忘记注入而打出打不开的包。
 
 ## 目录结构
 

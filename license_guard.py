@@ -629,8 +629,17 @@ class LicenseGuard:
                 self._raise("CLOCK_TAMPERED", "检测到系统时间被修改，授权校验失败")
 
             # ── 1) 有缓存令牌 → 先尝试离线判定 ──────────────────
-            cached = self._state.get("token")
             payload: Optional[Dict[str, Any]] = None
+            cached = self._state.get("token")
+            # 缓存令牌只对「签发它时用的那把授权码」有效。授权码换掉之后必须
+            # 当作全新安装：清掉缓存，走 /v1/activate 重新占设备位。
+            # 否则会拿旧令牌去 /v1/verify，而后端在新授权码下查不到本机的激活
+            # 记录，直接回 DEVICE_NOT_ACTIVATED —— 换码后的老用户会打不开程序。
+            if cached and (self._state.get("license_key") or "").strip() != raw_key:
+                self._log("授权码已变更，作废本地缓存令牌，按首次激活处理")
+                self.store.clear()
+                self._state = {}
+                cached = None
             if cached:
                 try:
                     payload = _Token.verify(cached, self.cfg.public_key, self.cfg.sign_alg)

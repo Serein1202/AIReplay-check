@@ -20,6 +20,13 @@ name: Build EXE & Publish Release
 #       没发出 Release，下次也不会重复用同一个号（tag 已推，号已占）。
 # 注 2：workflow_dispatch 仅用于「重发某个 tag」或验证打包流程；
 #       留空 = 取最新已有 tag 原样重发，不会 +1。
+#
+# ⚠️ 必需的仓库 Secret（Settings → Secrets and variables → Actions）：
+#     APP_LICENSE_KEY = 授权码（形如 XXXX-XXXX-XXXX-XXXX）
+#   授权码不写进仓库，打包前由「注入授权码到脚本」步骤注入到 LICENSE_KEY；
+#   注入失败（Secret 缺失 / 格式不对 / 回读不一致）会直接让构建失败 ——
+#   绝不能发出一个没有授权码、谁都打不开的 exe。
+#   换码流程：改 Secret → Actions 里重跑本 workflow（或随便 push 一次），无需改代码。
 on:
   push:
     branches:
@@ -219,6 +226,44 @@ jobs:
           if ($got -notmatch [regex]::Escape($ver)) {
               throw "版本号注入校验失败（期望 $ver）"
           }
+
+      - name: 注入授权码到脚本
+        shell: pwsh
+        env:
+          # 授权码不放仓库（公开仓库 + git 历史都查不到），改由 Secrets 提供。
+          # 换码时只需改这个 Secret 再重跑构建，不必改代码、不必提交。
+          APP_LICENSE_KEY: ${{ secrets.APP_LICENSE_KEY }}
+        run: |
+          $key = "$env:APP_LICENSE_KEY".Trim()
+          if (-not $key) {
+              throw "未取到授权码：secrets.APP_LICENSE_KEY 为空。请到仓库 Settings -> Secrets and variables -> Actions 新增名为 APP_LICENSE_KEY 的 Secret。"
+          }
+          if ($key -notmatch '^[A-Za-z0-9]{4}(-[A-Za-z0-9]{4}){3}$') {
+              throw "授权码格式不合法：期望形如 XXXX-XXXX-XXXX-XXXX（仅字母数字，三段连字符）。"
+          }
+
+          $path = Join-Path (Get-Location) $env:ENTRY
+          $text = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+
+          $pattern = '(?m)^LICENSE_KEY\s*=\s*"([^"]*)"'
+          if ($text -notmatch $pattern) {
+              throw "在 $env:ENTRY 中未找到 LICENSE_KEY 定义行，无法注入授权码"
+          }
+
+          $new = [regex]::Replace($text, $pattern, 'LICENSE_KEY = "' + $key + '"')
+          [System.IO.File]::WriteAllText($path, $new, (New-Object System.Text.UTF8Encoding($false)))
+
+          # 回读校验：注入后的值必须与 Secret 完全一致。
+          # 宁可让构建失败，也绝不能发出一个「没有授权码、谁都打不开」的 exe。
+          $got = [regex]::Match(
+              [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8),
+              $pattern).Groups[1].Value
+          if ($got -ne $key) {
+              throw "授权码注入校验失败（写入值与 Secret 不一致）"
+          }
+
+          # 只报长度，绝不回显授权码本身
+          Write-Host ("授权码注入完成：{0} 段 / 共 {1} 字符（值不回显）" -f (($key -split '-').Count), $key.Length)
 
       - name: 打包 exe
         shell: pwsh

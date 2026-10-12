@@ -25,9 +25,9 @@ Replay 核查一体化脚本（图形界面版）
       · 任何情况下都不弹授权对话框（即使后台把「到期时的行为」设成「弹提示后退出」）
       · **命令行也零输出**：没有 --license 之类的子命令，校验失败不打印任何字样
       · 诊断信息默认全部丢弃；排障时设 AIREPLAY_LICENSE_TRACE=<文件路径> 才写盘
-  - 授权码已内置在脚本里，无需额外的 license.key 文件
-    （如需按客户分发不同授权码，优先级为：环境变量 LICENSE_KEY >
-      程序同目录 license.key > 脚本内置 LICENSE_KEY）
+  - 授权码**不写进仓库**：仓库里 LICENSE_KEY 为空，正式构建时由 CI 从 GitHub Secrets
+    注入到脚本里再打包（这样公开仓库和 git 历史里都查不到授权码）
+    （运行时的覆盖优先级：环境变量 LICENSE_KEY > 程序同目录 license.key > 脚本内置 LICENSE_KEY）
   - 其余策略完全跟随后台设置，客户端不自行揣测：
       心跳间隔、断网容忍天数、到期后宽限、设备数上限、令牌有效期
       全部由后台下发并原样执行（后台的「到期时的行为」仅保留退出码效果）
@@ -63,6 +63,9 @@ Replay 核查一体化脚本（图形界面版）
   - 打开程序后自动检测最新版本；发现更高版本时弹窗提示，可一键下载并重启到新版本
   - 新版本下载到 exe 同目录，文件名形如 AIReplay-<版本号>.exe；
     重启后由新版本自动清理旧版本文件，目录里不会堆积历史 exe
+  - 检测与下载都是「直连优先，失败自动切换加速线路」：
+    见 UPDATE_API_MIRRORS / UPDATE_ASSET_MIRRORS，国内网络下能显著减少「下载失败」；
+    下载失败会自动换下一条线路重试，全部线路都不通才报错
   - 界面（更新说明、失败提示、日志区）一律不出现仓库地址，
     也不引导用户去外部页面手动下载；网络不可达时静默跳过，不影响正常使用
   - 关闭自动检测: 设置环境变量 AIREPLAY_NO_UPDATE=1，或把 UPDATE_AUTO_CHECK 改为 False
@@ -172,9 +175,26 @@ APP_VERSION_PLACEHOLDER = "0.0.0"
 GITHUB_REPO = "Serein1202/AIReplay-check"
 UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
 UPDATE_TIMEOUT = 15                # 检测 / 下载超时（秒）
+UPDATE_DL_TIMEOUT = 25             # 下载单条线路的超时（秒）。下载比检测宽松些
+UPDATE_DL_ATTEMPTS = 3             # 同一条线路内最多尝试几次（每次从断点续传）
 UPDATE_ASSET_PREFIX = "AIReplay-"  # Release 中 exe 资产的文件名前缀
 UPDATE_AUTO_CHECK = True           # 启动时自动检测更新（环境变量 AIREPLAY_NO_UPDATE=1 可临时关闭）
 UPDATE_MARKER = ".aireplay_update.json"  # 记录上次在线更新后待清理的旧文件
+
+# 下载加速线路（前缀式镜像：最终地址 = 前缀 + 原始地址）。
+# 国内直连不稳定时，自动依次切换，避免「下载失败」。
+#   · 检测更新（api）与下载（releases）都能走：gh-proxy.org
+#   · 只能代理文件下载：ghproxy.net
+# 线路只影响「去哪儿取包」，界面上不会出现任何线路地址。
+UPDATE_API_MIRRORS = (
+    "https://gh-proxy.org/",
+)
+UPDATE_ASSET_MIRRORS = (
+    "https://gh-proxy.org/",
+    "https://ghproxy.net/",
+)
+# 下载完整性下限：正常产物约 35 MB，小于该值视为没下到真东西
+UPDATE_MIN_BYTES = 1024 * 1024
 
 # ====================== 授权验证（License Guard）======================
 # 由自建 Cloudflare Worker（license-guard）签发授权令牌，客户端只做验签：
@@ -190,8 +210,14 @@ LICENSE_SERVER = "https://license-guard.xhd19981202.workers.dev"
 LICENSE_APP_ID = "583729164"                              # 后台创建软件时填的 app_id
 LICENSE_PUBLIC_KEY = "LjZLPnhcuJ5qJEtNi1axHbc54lvk-wfN5wcCTfZzIEk"  # Ed25519 公钥(b64url)
 LICENSE_SIGN_ALG = "ed25519"                              # ed25519 | es256
-# 内置授权码。留空时依次回退到：环境变量 LICENSE_KEY → 程序同目录 license.key
-LICENSE_KEY = "8R45-XM60-AMYQ-7NF4"
+# 内置授权码。**仓库里刻意留空** —— 正式构建时由 CI 从 GitHub Secrets 注入
+# （见 .github/workflows/build-release.yml 的「注入授权码到脚本」步骤）。
+# 这样公开仓库及 git 历史里都查不到授权码，换码也只需改 Secret 重跑构建。
+# 本地运行 / 本地打包时的回退顺序（见 resolve_license_key）：
+#   1. 环境变量 LICENSE_KEY
+#   2. 程序同目录（或当前工作目录）的 license.key   ← 本地开发推荐，已在 .gitignore
+# 三项都为空时程序不会启动（拿不到授权码）。
+LICENSE_KEY = ""
 LICENSE_FILE_NAME = "license.key"                         # 备用授权码文件（内置授权码有效时可不存在）
 LICENSE_TIMEOUT = 8                                       # 单次校验请求超时（秒）
 # 运行期复查间隔（秒）—— 决定「程序一直开着」时多久能感知到后台的
@@ -492,6 +518,15 @@ _SLUG_RE = re.compile(r"\b[\w.\-]+/[A-Za-z0-9._\-]*AIReplay[A-Za-z0-9._\-]*\b")
 # 删掉域名 / 仓库标识后可能残留的路径片段（如 "/releases"、"//releases"）
 _PATH_RE = re.compile(r"(?<![\w.\-])/[\w.\-/]*")
 _BRAND_RE = re.compile(r"\bGitHub\b", re.I)
+# 加速线路的域名同样只在程序内部使用，界面上一个字都不能出现
+_MIRROR_HOSTS = sorted({
+    urllib.parse.urlsplit(_p).hostname
+    for _p in (tuple(UPDATE_API_MIRRORS) + tuple(UPDATE_ASSET_MIRRORS))
+    if urllib.parse.urlsplit(_p).hostname
+})
+_MIRROR_RE = (
+    re.compile(r"\b(?:[\w-]+\.)*(?:" + "|".join(re.escape(_h) for _h in _MIRROR_HOSTS) + r")\b", re.I)
+    if _MIRROR_HOSTS else None)
 _GUIDE_RE = re.compile(
     r"(?:Full\s*Changelog|Changelog|详见|参见|请见|可见|此链接|该链接|链接|"
     r"手动下载|自行下载|重新下载|下载地址|请前往|请访问|请到|前往|访问|点击|官网)",
@@ -591,9 +626,12 @@ def scrub_update_text(text):
     for raw in md_to_plain(text).splitlines():
         if _META_RE.search(raw):
             continue                           # 构建细节行：整行不展示
-        hit = bool(_URL_RE.search(raw) or _HOST_RE.search(raw) or _SLUG_RE.search(raw))
+        hit = bool(_URL_RE.search(raw) or _HOST_RE.search(raw) or _SLUG_RE.search(raw)
+                   or (_MIRROR_RE and _MIRROR_RE.search(raw)))
         line = _URL_RE.sub("", raw)
         line = _HOST_RE.sub("", line)
+        if _MIRROR_RE:
+            line = _MIRROR_RE.sub("", line)
         line = _SLUG_RE.sub("", line)
         line = _BRAND_RE.sub("更新服务", line)
         if hit:
@@ -617,6 +655,39 @@ def scrub_update_text(text):
     return "\n".join(out)
 
 
+def _fetch_release_json():
+    """取最新 Release 的 JSON：直连优先，失败后依次走加速线路。
+
+    返回 (data, err_msg)；err_msg 为 None 表示成功。错误文案不含任何地址。
+    """
+    urls = [UPDATE_API] + [m + UPDATE_API for m in UPDATE_API_MIRRORS]
+    last_err = None
+    for u in urls:
+        req = urllib.request.Request(
+            u,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": f"AIReplay-check/{current_app_version()}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT) as resp:
+                return json.loads(resp.read().decode("utf-8")), None
+        except urllib.error.HTTPError as e:
+            last_err = e
+            # 只有「直连」的 404 才算数（真没有 Release）；线路配额/限流一律换下一条再试
+            if e.code == 404 and u == urls[0]:
+                return None, "暂时没有可用的更新信息"
+            continue
+        except Exception as e:
+            last_err = e
+            continue
+    # 全部线路都不通：只保留异常类型，不把可能含地址的原文带到界面上
+    if isinstance(last_err, urllib.error.HTTPError):
+        return None, f"更新服务返回异常（HTTP {last_err.code}）"
+    return None, f"网络异常，暂时无法获取更新信息（{type(last_err).__name__}）"
+
+
 def check_for_update():
     """查询更新服务上的最新版本信息。
 
@@ -625,25 +696,9 @@ def check_for_update():
       ("latest", info)  已是最新版本
       ("error",  msg)   检测失败（网络不可达 / 尚无 Release 等），msg 为可读说明
     """
-    req = urllib.request.Request(
-        UPDATE_API,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": f"AIReplay-check/{current_app_version()}",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return ("error", "暂时没有可用的更新信息")
-        if e.code == 403:
-            return ("error", "更新服务暂时不可用（请求过于频繁），请稍后再试")
-        return ("error", f"更新服务返回异常（HTTP {e.code}）")
-    except Exception as e:
-        # 只保留异常类型，不把可能含 URL 的异常原文带到界面上
-        return ("error", f"网络异常，暂时无法获取更新信息（{type(e).__name__}）")
+    data, err = _fetch_release_json()
+    if err:
+        return ("error", err)
 
     tag = (data.get("tag_name") or "").strip()
     assets = data.get("assets") or []
@@ -676,30 +731,46 @@ def check_for_update():
     return ("latest", info)
 
 
-def download_update(info, on_progress=None):
-    """下载新版本 exe 到程序所在目录，返回新文件路径。
+def update_candidates(url):
+    """按「直连 → 各加速线路」排出候选下载地址（地址本身不展示给用户）。"""
+    urls = [url]
+    for m in UPDATE_ASSET_MIRRORS:
+        u = m + url
+        if u not in urls:
+            urls.append(u)
+    return urls
 
-    先写入 .part 再改名，避免下载中断留下的半成品被误当成可用程序。
+
+def _download_once(url, tmp, expect, on_progress=None):
+    """把 url 的内容下载 / 续传到 tmp，返回 tmp 当前的总字节数。
+
+    支持断点续传：tmp 里已有内容时用 Range 从断点继续；
+    线路不支持 Range（回 200 而不是 206）就丢掉重下。
+    国内线路经常「连得上、下到一半断流」，续传能显著提高成功率。
     """
-    url = info.get("url") or ""
-    name = info.get("asset_name") or ""
-    if not url or not name:
-        raise RuntimeError("下载地址或文件名缺失")
+    offset = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+    if expect and offset >= expect:
+        return offset
 
-    dest = os.path.join(script_dir(), os.path.basename(name))
-    tmp = dest + ".part"
-    try:
-        os.remove(tmp)
-    except OSError:
-        pass
+    headers = {
+        "User-Agent": f"AIReplay-check/{current_app_version()}",
+        "Accept-Encoding": "identity",     # 避免线路把包压一遍导致字节数对不上
+    }
+    if offset:
+        headers["Range"] = f"bytes={offset}-"
 
-    req = urllib.request.Request(
-        url, headers={"User-Agent": f"AIReplay-check/{current_app_version()}"}
-    )
-    got = 0
-    try:
-        with urllib.request.urlopen(req, timeout=UPDATE_TIMEOUT) as resp, open(tmp, "wb") as f:
-            total = int(resp.headers.get("Content-Length") or info.get("size") or 0)
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=UPDATE_DL_TIMEOUT) as resp:
+        if offset and getattr(resp, "status", 200) != 206:
+            offset = 0                     # 线路不支持续传，从头写过
+            mode = "wb"
+        else:
+            mode = "ab"
+        total = int(resp.headers.get("Content-Length") or 0) + offset
+        if not total:
+            total = expect or 0
+        got = offset
+        with open(tmp, mode) as f:
             while True:
                 chunk = resp.read(256 * 1024)
                 if not chunk:
@@ -711,30 +782,88 @@ def download_update(info, on_progress=None):
                         on_progress(got, total)
                     except Exception:
                         pass
-    except Exception:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
-        raise
+    return got
 
-    # 完整性校验：正常产物约 35 MB，明显偏小视为失败
-    if got < 1024 * 1024:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+
+def _verify_asset(path, got, expect):
+    """产物校验：字节数对得上，且确实是 Windows 可执行文件（PE 头 MZ）。
+
+    线路返回错误页 / 半截包时（HTTP 200 也可能是网页），靠这两条挡住。
+    """
+    if got < UPDATE_MIN_BYTES:
         raise RuntimeError(f"下载内容不完整（仅 {got} 字节）")
-    if total and got != total:
+    if expect and got != expect:
+        raise RuntimeError(f"下载不完整：{got} / {expect} 字节")
+    with open(path, "rb") as f:
+        if f.read(2) != b"MZ":
+            raise RuntimeError("下载内容不是有效的程序文件")
+
+
+def download_update(info, on_progress=None, on_stage=None):
+    """下载新版本 exe 到程序所在目录，返回新文件路径。
+
+    两层容错，专门对付「下载失败」：
+      1. 同一条线路内：断流就带着已有字节**续传**，最多试 UPDATE_DL_ATTEMPTS 次；
+      2. 线路之间：直连优先，不通就自动依次切到加速线路（UPDATE_ASSET_MIRRORS）。
+
+    全程只写 .part，校验通过才改名成正式文件；任何一次失败都不会
+    把半截文件当成可用程序，也不会在目录里留下残包。
+    """
+    url = info.get("url") or ""
+    name = info.get("asset_name") or ""
+    if not url or not name:
+        raise RuntimeError("下载地址或文件名缺失")
+
+    dest = os.path.join(script_dir(), os.path.basename(name))
+    tmp = dest + ".part"
+    expect = int(info.get("size") or 0)
+
+    lines = update_candidates(url)
+    last_err = None
+    for idx, u in enumerate(lines, 1):
         try:
-            os.remove(tmp)
+            os.remove(tmp)                 # 换线路：丢弃上一条线路的残包
         except OSError:
             pass
-        raise RuntimeError(f"下载不完整：{got} / {total} 字节")
+        if idx > 1:
+            if on_progress:
+                try:
+                    on_progress(0, expect)
+                except Exception:
+                    pass
+            if on_stage:
+                try:
+                    on_stage(idx, len(lines))
+                except Exception:
+                    pass
+        for att in range(1, UPDATE_DL_ATTEMPTS + 1):
+            try:
+                got = _download_once(u, tmp, expect, on_progress)
+            except Exception as e:
+                last_err = e
+                log(f"[更新] 第 {idx}/{len(lines)} 条线路第 {att} 次中断：{type(e).__name__}")
+                continue                   # 保留 .part，下次续传
+            if expect and got < expect:
+                last_err = RuntimeError(f"下载不完整：{got} / {expect} 字节")
+                log(f"[更新] 第 {idx}/{len(lines)} 条线路第 {att} 次不完整：{got}/{expect}")
+                continue                   # 保留 .part，下次续传
+            try:
+                _verify_asset(tmp, got, expect)
+            except Exception as e:
+                last_err = e
+                log(f"[更新] 第 {idx}/{len(lines)} 条线路内容校验未通过，换线路")
+                break                      # 内容不对，重试同一条线路没意义
+            os.replace(tmp, dest)
+            log(f"[更新] 新版本已下载完成: {dest}")
+            return dest
+        try:
+            os.remove(tmp)                 # 本条线路用尽：删残包再换下一条
+        except OSError:
+            pass
 
-    os.replace(tmp, dest)
-    log(f"[更新] 新版本已下载完成: {dest}")
-    return dest
+    raise RuntimeError(
+        f"下载未完成（{type(last_err).__name__}，已尝试 {len(lines)} 条线路）"
+    ) from last_err
 
 
 def launch_detached(path):
@@ -2003,6 +2132,8 @@ if ctk is not None:
             self.app = master
             self.info = info
             self._busy = False
+            self._line = 1        # 当前下载线路序号（>1 时会显示「第 n/总 条线路」）
+            self._lines = 1
 
             self.title("发现新版本")
             self.configure(fg_color=CLR["win"])
@@ -2119,20 +2250,47 @@ if ctk is not None:
                     self.info,
                     on_progress=lambda got, total: self.app._q.put(
                         ("update_progress", (got, total))),
+                    on_stage=lambda idx, n: self.app._q.put(("update_stage", (idx, n))),
                 )
             except Exception as e:
                 self.app._q.put(("update_error", f"{type(e).__name__}: {e}"))
                 return
             self.app._q.put(("update_ready", path))
 
+        def _on_stage(self, idx, lines):
+            """换到第 idx 条下载线路：记下行号，状态行给一句中性提示。
+
+            文案里不含任何地址 / 平台名，只告诉用户「正在自动换条路重试」。
+            """
+            try:
+                self._line, self._lines = idx, lines
+                self.lbl_msg.configure(
+                    text=f"当前线路不顺畅，正在自动切换（第 {idx}/{lines} 条）…")
+            except Exception:
+                pass
+
         def _on_progress(self, got, total):
             try:
                 if total:
                     self.progress.set(min(1.0, got / total))
-                    self.lbl_msg.configure(
-                        text=f"正在下载… {got / 1048576:.1f} / {total / 1048576:.1f} MB")
+                    text = f"正在下载… {got / 1048576:.1f} / {total / 1048576:.1f} MB"
                 else:
-                    self.lbl_msg.configure(text=f"正在下载… {got / 1048576:.1f} MB")
+                    text = f"正在下载… {got / 1048576:.1f} MB"
+                if self._line > 1:
+                    text += f"（第 {self._line}/{self._lines} 条线路）"
+                self.lbl_msg.configure(text=text)
+            except Exception:
+                pass
+
+        def _on_stage(self, idx, lines):
+            """换到第 idx 条下载线路：记下行号，状态行给一句中性提示。
+
+            文案里不含任何地址 / 平台名，只告诉用户「正在自动换条路重试」。
+            """
+            try:
+                self._line, self._lines = idx, lines
+                self.lbl_msg.configure(
+                    text=f"当前线路不顺畅，正在自动切换（第 {idx}/{lines} 条）…")
             except Exception:
                 pass
 
@@ -2396,6 +2554,9 @@ if ctk is not None:
                     elif kind == "update_progress":
                         if self._update_dialog is not None:
                             self._update_dialog._on_progress(payload[0], payload[1])
+                    elif kind == "update_stage":
+                        if self._update_dialog is not None:
+                            self._update_dialog._on_stage(payload[0], payload[1])
                     elif kind == "update_ready":
                         if self._update_dialog is not None:
                             self._update_dialog._on_ready(payload)
