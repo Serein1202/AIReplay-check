@@ -146,7 +146,7 @@ TEXT_COLUMN_LETTERS = []
 # CSV 表头（与页面表格列一一对应）
 CSV_HEADERS = [
     "#", "处理状态", "角色名", "角色ID", "无端ID", "房间号", "分数",
-    "开始时间", "战斗耗时", "上报时间", "处理人", "处理时间", "封禁状态", "备注",
+    "开始时间", "结束时间", "战斗耗时", "上报时间", "处理人", "处理时间", "封禁状态", "备注",
 ]
 # 处理状态码 → 文案
 STATUS_TEXT = {3: "已核查"}
@@ -1620,6 +1620,7 @@ def item_to_row(it):
         it.get("room_id", ""),
         it.get("score", ""),
         it.get("start_date", ""),
+        it.get("end_date", ""),
         it.get("duration", ""),
         it.get("report_at", ""),
         it.get("operator", ""),
