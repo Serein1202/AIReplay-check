@@ -41,7 +41,9 @@ Replay 核查一体化脚本（图形界面版）
     1. 环境变量 AMIS_TOKEN
     2. 本地 Token 缓存（脚本 / exe 同目录下的 .amis_token.json，未过期时直接复用）
     3. 本机 Chrome / Edge 中 amis.ssjj.cn 的有效 Token（AMIS-USER-TOKEN）
-    4. 以上均不可用（未找到或已过期）时，自动弹出登录框，手动登录换取新 Token 后继续抓取
+    4. 以上均不可用（未找到或已过期）时，先尝试用本机加密保存的账号密码自动登录
+       换取新 Token（全程不弹框）；自动登录不可用（未保存凭据 / 凭据被服务端拒绝 /
+       网络或服务异常）时才弹出登录框手动登录
   本地 Token 缓存:
     - 登录成功（含自动弹框登录）后统一写入缓存，内容仅 token / account / expire / saved_at
     - 缓存命中且未过期 → 直接使用并在日志中提示来源与有效期，不再要求重新登录
@@ -50,9 +52,20 @@ Replay 核查一体化脚本（图形界面版）
       登录成功后覆盖写入缓存并继续本次抓取，无需用户重跑
     - 缓存文件损坏或解析失败时按无缓存处理，并删除该文件
     - 密码仅在内存中使用，绝不写入缓存、日志或代码
+  本机加密凭据（.amis_credentials.bin）:
+    - 登录框勾选「记住账号密码（本机加密保存）」且登录成功后，用 Windows DPAPI
+      （CryptProtectData，ctypes 调用，不新增 pywin32 依赖）将
+      {account, password, ldap, saved_at} 加密写入脚本 / exe 同目录下的
+      .amis_credentials.bin，密码不以明文落盘
+    - Token 缺失 / 过期 / 被服务端判定失效时，优先用已保存凭据自动登录换取新
+      Token；凭据被服务端拒绝（如账号密码错误）时自动删除本地凭据，再回退到
+      登录框手动登录
+    - 登录框取消勾选「记住账号密码」后登录成功，会删除已保存的本地凭据；
+      凭据文件损坏或无法解密时按未保存处理并自动删除
   登录框:
-    - 框内展示登录网址 http://amis.ssjj.cn/，含账号、密码（掩码显示）与「LDAP 登录」
-      复选项（默认不勾选，使用 LDAP 账号时勾选）
+    - 框内展示登录网址 http://amis.ssjj.cn/，含账号、密码（掩码显示）、
+      「LDAP 登录」复选项（默认不勾选，使用 LDAP 账号时勾选）与
+      「记住账号密码（本机加密保存）」复选项（默认勾选）
     - 调用 POST http://amis.ssjj.cn/auth/signIn（Header X-PROJECT-ID: 1，
       体 {"account","password","ldap"}）换取 Token
     - 登录失败会提示服务端返回的 msg 并允许重试（最多 3 次）；全部失败或取消则中止本次抓取
@@ -87,6 +100,8 @@ Replay 核查一体化脚本（图形界面版）
 
 import base64
 import csv
+import ctypes
+from ctypes import wintypes
 import json
 import os
 import queue
@@ -119,6 +134,9 @@ LOGIN_MAX_RETRY = 3              # 手动登录最大重试次数
 
 # 本地 Token 缓存：保存于脚本 / exe 同目录，避免每次抓取都重新登录
 TOKEN_CACHE_NAME = ".amis_token.json"
+
+# 本机加密凭据：保存于脚本 / exe 同目录（Windows DPAPI 加密，用于 Token 失效时自动登录）
+CREDENTIALS_FILE_NAME = ".amis_credentials.bin"
 
 # 输出命名（YYYYMMDD 由输入日期填充）
 CSV_NAME_TPL = "replay已核查-{day}.csv"
@@ -1250,6 +1268,123 @@ def remove_token_cache(reason=""):
         return False
 
 
+# ---------------------------------------------------------------- 本机加密凭据（Windows DPAPI）
+# 登录框勾选「记住账号密码（本机加密保存）」且登录成功后，将账号密码经 DPAPI
+# （CryptProtectData，ctypes 调用，不新增 pywin32 依赖）加密写入脚本 / exe 同目录下的
+# .amis_credentials.bin，供 Token 缺失 / 过期 / 失效时自动登录使用。密码不以明文落盘，
+# 也不写入日志 / 缓存 / 代码，仅在内存中传递。
+class _DATA_BLOB(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", wintypes.LPVOID)]
+
+
+def _dpapi_protect(data):
+    """Windows DPAPI 加密 bytes，返回密文 bytes；失败抛 OSError"""
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob_in = _DATA_BLOB(len(data), ctypes.cast(buf, wintypes.LPVOID))
+    blob_out = _DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptProtectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
+        raise OSError(f"CryptProtectData 失败（错误码 {ctypes.get_last_error()}）")
+    try:
+        raw = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+    return bytes(raw)
+
+
+def _dpapi_unprotect(data):
+    """Windows DPAPI 解密 bytes，返回明文 bytes；失败抛 OSError"""
+    buf = ctypes.create_string_buffer(data, len(data))
+    blob_in = _DATA_BLOB(len(data), ctypes.cast(buf, wintypes.LPVOID))
+    blob_out = _DATA_BLOB()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)):
+        raise OSError(f"CryptUnprotectData 失败（错误码 {ctypes.get_last_error()}）")
+    try:
+        raw = ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+    return bytes(raw)
+
+
+def credentials_path():
+    """本机加密凭据文件路径（脚本 / exe 同目录下的 .amis_credentials.bin）"""
+    return os.path.join(script_dir(), CREDENTIALS_FILE_NAME)
+
+
+def save_credentials(account, password, ldap=False):
+    """加密保存账号密码到本机（供 Token 失效时自动登录）
+
+    写入内容为 {account, password, ldap, saved_at}，整包经 DPAPI 加密。
+    仅接受内存中已有的明文，不读取任何外部来源；失败只记日志，不影响登录流程。
+    """
+    account = str(account or "").strip()
+    if not account or password is None:
+        return False
+    payload = {
+        "account": account,
+        "password": str(password),
+        "ldap": bool(ldap),
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        path = credentials_path()
+        with open(path, "wb") as f:
+            f.write(_dpapi_protect(raw))
+        log(f"[凭据] 账号密码已加密保存到本机（{path}）。")
+        return True
+    except Exception as e:
+        log(f"[警告] 账号密码加密保存失败（不影响本次登录）: {e}")
+        return False
+
+
+def load_credentials():
+    """读取并解密本机凭据；返回 dict 或 None（无文件 / 损坏 / 解密失败时按无凭据处理）"""
+    path = credentials_path()
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            enc = f.read()
+        data = json.loads(_dpapi_unprotect(enc).decode("utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("凭据内容不是 JSON 对象")
+        account = str(data.get("account") or "").strip()
+        password = str(data.get("password") or "")
+        if not account or not password:
+            raise ValueError("凭据缺少账号或密码")
+        return {
+            "account": account,
+            "password": password,
+            "ldap": bool(data.get("ldap")),
+            "saved_at": str(data.get("saved_at") or ""),
+        }
+    except Exception as e:
+        log(f"[警告] 本机加密凭据损坏或无法解密，已删除并视为未保存: {e}")
+        remove_credentials("凭据损坏或无法解密")
+        return None
+
+
+def remove_credentials(reason=""):
+    """删除本机加密凭据文件（用户取消勾选 / 凭据被服务端拒绝 / 凭据损坏时调用）"""
+    path = credentials_path()
+    if not os.path.isfile(path):
+        return False
+    try:
+        os.remove(path)
+        note = f"（{reason}）" if reason else ""
+        log(f"[凭据] 已删除本机加密保存的账号密码{note}: {path}")
+        return True
+    except Exception as e:
+        log(f"[警告] 本机加密凭据删除失败: {e}")
+        return False
+
+
+class CredentialsRejectedError(RuntimeError):
+    """服务端明确拒绝本次登录凭据（账号 / 密码错误、账号停用等）"""
+
+
 class TokenInvalidError(RuntimeError):
     """服务端判定登录态失效（HTTP 401/403 或返回鉴权 / 登录失效类错误码、消息）"""
 
@@ -1330,7 +1465,8 @@ _LOGIN_UI = None
 def login_by_password(account, password, ldap=True):
     """调用后台登录接口换取新 Token（与界面完全解耦）
 
-    成功返回 (token, info)；失败抛出 RuntimeError，消息为服务端返回的 msg。
+    成功返回 (token, info)；凭据被服务端拒绝（账号 / 密码错误等）时抛
+    CredentialsRejectedError；网络 / HTTP 异常抛 RuntimeError，消息为错误说明。
     账号密码仅在本函数调用期间存在于内存中，不做任何持久化。
     """
     body = json.dumps({
@@ -1363,7 +1499,8 @@ def login_by_password(account, password, ldap=True):
         raise RuntimeError(f"登录请求发送失败：{e}")
 
     if payload.get("code") != 0:
-        raise RuntimeError(payload.get("msg") or f"登录失败（code={payload.get('code')}）")
+        raise CredentialsRejectedError(
+            payload.get("msg") or f"登录失败（code={payload.get('code')}）")
 
     token = str(((payload.get("data") or {}).get("token")) or "").strip()
     if not token:
@@ -1375,9 +1512,34 @@ def login_by_password(account, password, ldap=True):
     return token, info
 
 
-def ask_credentials(tip="", error="", default_account=""):
-    """弹出登录框收集凭据；返回 (account, password, ldap)，用户取消返回 None
+def try_auto_login():
+    """用本机加密保存的凭据自动登录换取新 Token（全程不弹框）
 
+    返回 (token, info)：自动登录成功（并已写入 Token 缓存）；
+    返回 None：未保存凭据，或凭据被服务端拒绝（此时已自动删除本地凭据，
+    由调用方回退到手动登录框），或网络 / 服务异常（保留本地凭据）。
+    """
+    creds = load_credentials()
+    if not creds:
+        return None
+    try:
+        token, info = login_by_password(creds["account"], creds["password"], creds["ldap"])
+    except CredentialsRejectedError as e:
+        remove_credentials("已保存凭据被服务端拒绝（账号或密码可能已变更）")
+        log(f"[自动登录] 已保存凭据被服务端拒绝，已删除本机凭据，将回退手动登录: {e}")
+        return None
+    except Exception as e:
+        log(f"[自动登录] 网络或服务异常，保留本机凭据，本次回退手动登录: {e}")
+        return None
+    save_token_cache(token, info)
+    log("[自动登录] 使用已保存的账号密码登录成功，已刷新 Token 缓存，全程未弹框。")
+    return token, info
+
+
+def ask_credentials(tip="", error="", default_account=""):
+    """弹出登录框收集凭据；返回 (account, password, ldap, remember)，用户取消返回 None
+
+    remember 表示「记住账号密码（本机加密保存）」是否勾选（默认勾选）。
     UI 与登录逻辑解耦：GUI 模式下走 _LOGIN_UI 注册的深色对话框，
     其余场景回退到原生 tkinter 对话框。
     """
@@ -1425,8 +1587,13 @@ def _ask_credentials_tk(tip="", error="", default_account=""):
     tk.Checkbutton(root, text="LDAP 登录（本后台使用 LDAP 账号时请勾选）", variable=var_ldap).grid(
         row=5, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 2))
 
+    # 记住账号密码（本机加密保存，默认勾选；登录成功且勾选才写入 DPAPI 加密凭据）
+    var_remember = tk.BooleanVar(value=True)
+    tk.Checkbutton(root, text="记住账号密码（本机加密保存）", variable=var_remember).grid(
+        row=6, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 2))
+
     lbl_msg = tk.Label(root, text=error, fg="#EF4444", justify="left", wraplength=360)
-    lbl_msg.grid(row=6, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 4))
+    lbl_msg.grid(row=7, column=0, columnspan=2, sticky="w", padx=14, pady=(2, 4))
 
     def _submit():
         account = var_account.get().strip()
@@ -1434,8 +1601,8 @@ def _ask_credentials_tk(tip="", error="", default_account=""):
         if not account or not password:
             lbl_msg.configure(text="请输入账号和密码。")
             return
-        # 凭据仅放入内存结果，不做任何持久化
-        result["value"] = (account, password, bool(var_ldap.get()))
+        # 凭据仅放入内存结果，不做任何持久化；是否记住由登录成功后统一处理
+        result["value"] = (account, password, bool(var_ldap.get()), bool(var_remember.get()))
         root.destroy()
 
     def _cancel():
@@ -1443,7 +1610,7 @@ def _ask_credentials_tk(tip="", error="", default_account=""):
         root.destroy()
 
     btns = tk.Frame(root)
-    btns.grid(row=7, column=0, columnspan=2, sticky="e", padx=14, pady=(6, 14))
+    btns.grid(row=8, column=0, columnspan=2, sticky="e", padx=14, pady=(6, 14))
     tk.Button(btns, text="登录", width=12, command=_submit).pack(side="left", padx=(0, 8))
     tk.Button(btns, text="取消", width=8, command=_cancel).pack(side="left")
 
@@ -1476,7 +1643,7 @@ def obtain_token_by_login(reason=""):
                 "已取消登录：未取得 amis.ssjj.cn 的有效 Token，本次抓取中止。\n"
                 "可先在 Chrome / Edge 登录 amis.ssjj.cn，或设置环境变量 AMIS_TOKEN 后再试。"
             )
-        account, password, ldap = creds
+        account, password, ldap, remember = creds
         default_account = account
         try:
             token, info = login_by_password(account, password, ldap)
@@ -1492,6 +1659,11 @@ def obtain_token_by_login(reason=""):
             )
         log(f"[登录成功] 已获取 amis.ssjj.cn 登录 Token"
             f"（第 {attempt} 次尝试，LDAP={'是' if ldap else '否'}）。")
+        # 记住账号密码（本机加密保存）：勾选则加密保存，取消勾选则删除已存凭据
+        if remember:
+            save_credentials(account, password, ldap)
+        else:
+            remove_credentials("登录框未勾选「记住账号密码」")
         # 登录成功统一写入本地缓存（仅 Token 与账号，密码不落盘）
         save_token_cache(token, info)
         return token, info
@@ -1552,9 +1724,10 @@ def fetch_day(day):
     """抓取指定日期 00:00:00 ~ 次日 00:00:00 的已核查记录
 
     Token 获取顺序：环境变量 AMIS_TOKEN > 本地缓存 .amis_token.json（未过期）>
-    浏览器 Local Storage 有效 Token > 弹出登录框（手动输入账号密码换取新 Token）。
-    使用缓存 / 浏览器 Token 抓取时若被服务端判定失效，会自动删除缓存并弹出登录框，
-    登录成功后覆盖写入缓存并继续本次抓取，无需用户重跑。
+    浏览器 Local Storage 有效 Token > 本机加密凭据自动登录 > 弹出登录框。
+    Token 缺失 / 已过期 / 被服务端判定失效时，优先用已保存的账号密码自动登录换
+    新 Token（全程不弹框）；自动登录不可用（未保存凭据 / 凭据被拒 / 网络异常）时
+    才弹出登录框手动登录，登录成功后覆盖写入缓存并继续本次抓取，无需用户重跑。
     """
     token, info, source = find_amis_token()
     reason = ""
@@ -1567,9 +1740,15 @@ def fetch_day(day):
             reason = "自动获取到的 amis.ssjj.cn 登录 Token 已过期"
 
     if reason:
-        log(f"[提示] {reason}，请在登录窗口中输入账号密码换取新 Token。")
-        token, info = obtain_token_by_login(reason)
-        source = "登录框"
+        # 优先用已保存凭据自动登录换新 Token，不成功才弹框
+        auto = try_auto_login()
+        if auto:
+            token, info = auto
+            source = "自动登录（已保存凭据）"
+        else:
+            log(f"[提示] {reason}，自动登录未成功，请在登录窗口中输入账号密码换取新 Token。")
+            token, info = obtain_token_by_login(reason)
+            source = "登录框"
     else:
         _log_token_source(source, info)
 
@@ -1595,7 +1774,7 @@ def fetch_day(day):
             break
         except TokenInvalidError as e:
             log(f"[登录态失效] {e}")
-            # 服务端判定失效：删除本地缓存并弹框换新 Token
+            # 服务端判定失效：删除本地缓存，先自动登录换新 Token，不成功才弹框
             remove_token_cache("服务端判定登录态失效")
             if auth_retry >= LOGIN_MAX_RETRY:
                 raise RuntimeError(
@@ -1603,9 +1782,15 @@ def fetch_day(day):
                     f"最后一次错误：{e}"
                 )
             auth_retry += 1
-            log("[提示] 缓存 / 自动获取的 Token 已失效，请在登录窗口中重新登录以换取新 Token。")
-            token, info = obtain_token_by_login("自动获取的登录 Token 已失效，请重新登录")
-            account = info.get("account") or account
+            auto = try_auto_login()
+            if auto:
+                token, info = auto
+                account = info.get("account") or account
+            else:
+                log("[提示] 缓存 / 自动获取的 Token 已失效，自动登录未成功，"
+                    "请在登录窗口中重新登录以换取新 Token。")
+                token, info = obtain_token_by_login("自动获取的登录 Token 已失效，请重新登录")
+                account = info.get("account") or account
             # 登录成功已覆盖写入缓存，继续本次抓取
     return items, start_at, end_at
 
@@ -1981,8 +2166,9 @@ if ctk is not None:
 
     class LoginDialog(ctk.CTkToplevel):
         """登录对话框（深色）：账号 + 密码（掩码）+ LDAP 复选（默认不勾选）
+        + 记住账号密码（本机加密保存）复选（默认勾选）
 
-        只负责收集界面输入，返回 (account, password, ldap)；用户取消返回 None。
+        只负责收集界面输入，返回 (account, password, ldap, remember)；用户取消返回 None。
         实际的登录请求由 login_by_password() 完成，二者互不耦合。
         """
 
@@ -1993,7 +2179,7 @@ if ctk is not None:
             self.title("登录 amis.ssjj.cn")
             self.configure(fg_color=CLR["win"])
             self.resizable(False, False)
-            self.geometry("470x420")
+            self.geometry("470x470")
 
             f_h1 = ctk.CTkFont(family=FONT_UI, size=18, weight="bold")
             f_key = ctk.CTkFont(family=FONT_UI, size=12)
@@ -2056,10 +2242,19 @@ if ctk is not None:
                 border_color=CLR["line"], checkmark_color="#FFFFFF",
             ).grid(row=3, column=0, columnspan=2, sticky="w", padx=20, pady=(14, 4))
 
+            # 记住账号密码（本机加密保存，默认勾选；登录成功且勾选才写入 DPAPI 加密凭据）
+            self.var_remember = ctk.BooleanVar(value=True)
+            ctk.CTkCheckBox(
+                card, text="记住账号密码（本机加密保存）", variable=self.var_remember,
+                font=f_sub, text_color=CLR["text"], checkbox_width=18, checkbox_height=18,
+                corner_radius=5, fg_color=CLR["accent"], hover_color=CLR["accent_h"],
+                border_color=CLR["line"], checkmark_color="#FFFFFF",
+            ).grid(row=4, column=0, columnspan=2, sticky="w", padx=20, pady=(4, 2))
+
             # 服务端错误提示（重试时回显上一次失败原因）
             self.lbl_error = ctk.CTkLabel(card, text=error or "", font=f_sub,
                                           text_color=ERR_CLR, wraplength=390, justify="left")
-            self.lbl_error.grid(row=4, column=0, columnspan=2, sticky="w",
+            self.lbl_error.grid(row=5, column=0, columnspan=2, sticky="w",
                                 padx=20, pady=(6, 16))
 
             foot = ctk.CTkFrame(self, fg_color="transparent")
@@ -2112,8 +2307,9 @@ if ctk is not None:
             if not password:
                 self.lbl_error.configure(text="请输入密码。")
                 return
-            # 凭据仅放入内存结果，不做任何持久化
-            self._result = (account, password, bool(self.var_ldap.get()))
+            # 凭据仅放入内存结果，不做任何持久化；是否记住由登录成功后统一处理
+            self._result = (account, password, bool(self.var_ldap.get()),
+                            bool(self.var_remember.get()))
             self.destroy()
 
         def _cancel(self):
@@ -2121,7 +2317,7 @@ if ctk is not None:
             self.destroy()
 
         def wait(self):
-            """阻塞至对话框关闭，返回 (account, password, ldap) 或 None（取消）"""
+            """阻塞至对话框关闭，返回 (account, password, ldap, remember) 或 None（取消）"""
             self.wait_window(self)
             return self._result
 
