@@ -1277,6 +1277,16 @@ class _DATA_BLOB(ctypes.Structure):
     _fields_ = [("cbData", wintypes.DWORD), ("pbData", wintypes.LPVOID)]
 
 
+# ⚠️ 必须显式声明 LocalFree 的 argtypes。不声明时 ctypes 会把 Python int 按
+# 32 位 C int 转换，而 64 位进程里 DPAPI 返回的堆指针通常超过 2^31，
+# LocalFree(指针) 会抛 OverflowError（int too long to convert）——
+# 曾导致「加密成功但函数以异常收场」，save_credentials 只 open 没 write，
+# 凭据文件被写成 0 字节，记住的账号密码从未真正落盘。
+_LocalFree = ctypes.windll.kernel32.LocalFree
+_LocalFree.argtypes = [ctypes.c_void_p]      # 按指针宽度传递，高位地址不再溢出
+_LocalFree.restype = ctypes.c_void_p
+
+
 def _dpapi_protect(data):
     """Windows DPAPI 加密 bytes，返回密文 bytes；失败抛 OSError"""
     buf = ctypes.create_string_buffer(data, len(data))
@@ -1288,7 +1298,7 @@ def _dpapi_protect(data):
     try:
         raw = ctypes.string_at(blob_out.pbData, blob_out.cbData)
     finally:
-        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+        _LocalFree(blob_out.pbData)
     return bytes(raw)
 
 
@@ -1303,7 +1313,7 @@ def _dpapi_unprotect(data):
     try:
         raw = ctypes.string_at(blob_out.pbData, blob_out.cbData)
     finally:
-        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+        _LocalFree(blob_out.pbData)
     return bytes(raw)
 
 
@@ -1327,15 +1337,22 @@ def save_credentials(account, password, ldap=False):
         "ldap": bool(ldap),
         "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    # 先完成加密、再打开文件：一旦加密失败不会在磁盘上留下 0 字节的凭据文件
+    # （0 字节文件下次启动会被当作「凭据损坏」删掉，等同于从未记住过密码）
     try:
         raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        path = credentials_path()
+        enc = _dpapi_protect(raw)
+    except Exception as e:
+        log(f"[警告] 账号密码加密保存失败（不影响本次登录）: {e}")
+        return False
+    path = credentials_path()
+    try:
         with open(path, "wb") as f:
-            f.write(_dpapi_protect(raw))
+            f.write(enc)
         log(f"[凭据] 账号密码已加密保存到本机（{path}）。")
         return True
     except Exception as e:
-        log(f"[警告] 账号密码加密保存失败（不影响本次登录）: {e}")
+        log(f"[警告] 凭据文件写入失败（不影响本次登录）: {e}")
         return False
 
 
