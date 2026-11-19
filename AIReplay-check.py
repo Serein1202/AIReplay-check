@@ -11,6 +11,16 @@ Replay 核查一体化脚本（图形界面版）
   2. 点击「开始抓取并处理」，日志区实时滚动显示抓取与处理进度
   3. 完成后弹出结果卡片，统计筛选、去重行数，可一键打开输出目录
 
+输出与剪贴板:
+  - xlsx 生成后**不会自动打开文件**（也不弹 Excel），只在结果卡片里展示路径
+  - 生成后立即把 xlsx 的 CLIPBOARD_RANGE 区域（默认 C1:L11）复制到剪贴板，
+    同时写「制表符文本 + HTML 表格」两种格式：
+      粘到 Excel / WPS → 按单元格铺开；粘到微信 / 飞书 / Word → 直接变成表格
+  - 区域数据不足（当天行数少于 11）时自动裁掉尾部空行 / 空列，不会粘出一串空制表符
+  - 剪贴板被其他程序占用导致失败时只记一条警告，报表本身不受影响
+  - 结果卡片提供「再次复制 C1:L11」，无需重跑抓取
+  - 关闭：把 CLIPBOARD_ENABLED 改为 False（或 CLIPBOARD_RANGE 设为 ""）
+
 命令行用法:
   python AIReplay-check.py 20260924         # 静默模式（自动化 / 定时任务）
   python AIReplay-check.py --date 20260924  # 同上
@@ -99,6 +109,7 @@ Replay 核查一体化脚本（图形界面版）
 """
 
 import base64
+import calendar
 import csv
 import ctypes
 from ctypes import wintypes
@@ -141,6 +152,14 @@ CREDENTIALS_FILE_NAME = ".amis_credentials.bin"
 # 输出命名（YYYYMMDD 由输入日期填充）
 CSV_NAME_TPL = "replay已核查-{day}.csv"
 XLSX_NAME_TPL = "replay核查-{day}.xlsx"
+
+# 报表生成后自动复制到剪贴板的区域（Excel 的 A1 表示法，含首尾单元格）。
+# 复制内容同时提供「制表符分隔文本」与「HTML 表格」两种格式：
+#   · 粘到 Excel / WPS  → 按单元格铺开，保留行列
+#   · 粘到微信 / 飞书 / Word → 直接变成表格
+# 设为空串 "" 或把 CLIPBOARD_ENABLED 改 False 即可关闭该行为（关闭后不产生任何副作用）。
+CLIPBOARD_ENABLED = True
+CLIPBOARD_RANGE = "C1:L11"
 
 # 目标文件已存在时，是否先重命名保留旧文件（True=防覆盖，False=直接覆盖）
 PROTECT_EXISTING = True
@@ -1687,7 +1706,7 @@ def obtain_token_by_login(reason=""):
 
 
 # ---------------------------------------------------------------- 数据抓取
-def _fetch_pages(headers, start_at, end_at):
+def _fetch_pages(headers, start_at, end_at, progress=None):
     """按分页抓取全部记录；Token 失效时抛 TokenInvalidError，由上层换 Token 后重试"""
     items, page, total = [], 1, None
     while True:
@@ -1724,6 +1743,8 @@ def _fetch_pages(headers, start_at, end_at):
         total = data.get("total") if total is None else total
         items.extend(batch)
         log(f"[抓取] 第 {page} 页 {len(batch)} 条，累计 {len(items)}/{total} 条")
+        if progress:
+            progress(len(items), int(total or 0))
         if not batch or (total is not None and len(items) >= int(total)):
             break
         page += 1
@@ -1737,7 +1758,7 @@ def _log_token_source(source, info):
     log(f"[登录态] 已自动获取有效 Token（来源：{source or '未知'}{detail}）。")
 
 
-def fetch_day(day):
+def fetch_day(day, progress=None):
     """抓取指定日期 00:00:00 ~ 次日 00:00:00 的已核查记录
 
     Token 获取顺序：环境变量 AMIS_TOKEN > 本地缓存 .amis_token.json（未过期）>
@@ -1787,7 +1808,7 @@ def fetch_day(day):
             "Referer": HOST + "/",
         }
         try:
-            items = _fetch_pages(headers, start_at, end_at)
+            items = _fetch_pages(headers, start_at, end_at, progress)
             break
         except TokenInvalidError as e:
             log(f"[登录态失效] {e}")
@@ -1904,11 +1925,212 @@ def auto_fit_column_width(ws, padding=4, min_width=8, max_width=50):
         ws.column_dimensions[col_letter].width = min(max_width, max(min_width, max_len + padding))
 
 
+# ---------------------------------------------------------------- 剪贴板（输出后自动复制指定区域）
+# 只用 ctypes 调 Windows 剪贴板 API，不新增 pywin32 / pyperclip 依赖。
+# 之所以同时写「文本 + HTML」两种格式：Excel 系粘贴走文本（TSV 按单元格铺开），
+# 微信 / 飞书 / Word 粘贴走 HTML（直接出表格），一份数据两处都能用。
+CLIPBOARD_CF_UNICODETEXT = 13
+CLIPBOARD_HTML_CSS = (
+    "border-collapse:collapse;font-family:'Microsoft YaHei',sans-serif;font-size:10pt;"
+)
+CLIPBOARD_CELL_CSS = "padding:2px 6px 2px 6px;border:1px solid #B7BEC9;"
+
+
+def _clip_cell_text(value):
+    """把单元格值转成粘贴出去应当看到的文字（与 Excel 里显示的一致）"""
+    if value is None:
+        return ""
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(value, date):
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, float):
+        # 分数等数值列：整数别粘成 "12.0"；非整数用 15 位有效数字，避免 %g 把大数截成科学计数法
+        return str(int(value)) if value.is_integer() else f"{value:.15g}"
+    return str(value)
+
+
+def read_xlsx_range(xlsx_path, cell_range):
+    """读取 xlsx 指定区域的文字矩阵（已去掉尾部空行 / 空列）"""
+    from openpyxl import load_workbook
+    from openpyxl.utils import range_boundaries
+
+    min_col, min_row, max_col, max_row = range_boundaries(cell_range)
+    wb = load_workbook(xlsx_path, data_only=True)
+    try:
+        ws = wb.active
+        rows = [
+            [_clip_cell_text(ws.cell(row=r, column=c).value)
+             for c in range(min_col, max_col + 1)]
+            for r in range(min_row, max_row + 1)
+        ]
+    finally:
+        wb.close()
+
+    # 区域是写死的 C1:L11，当天数据不足时会剩一片空单元格：尾部空行 / 空列一律裁掉，
+    # 否则粘到聊天窗口里会带出一串空白制表符。
+    while rows and not any(cell.strip() for cell in rows[-1]):
+        rows.pop()
+    ncols = max((max((i + 1 for i, cell in enumerate(row) if cell.strip()), default=0)
+                 for row in rows), default=0)
+    return [row[:ncols] for row in rows]
+
+
+def _cf_html_document(rows):
+    """构造 Windows「HTML Format」剪贴板数据（带正确的字节偏移头）"""
+    def esc(text):
+        return (text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+    body = "".join(
+        "<tr>" + "".join(f'<td style="{CLIPBOARD_CELL_CSS}">{esc(cell)}</td>'
+                         for cell in row) + "</tr>"
+        for row in rows
+    )
+    fragment = (
+        f'<table border="1" cellspacing="0" cellpadding="0" '
+        f'style="{CLIPBOARD_HTML_CSS}border:1px solid #B7BEC9;">{body}</table>'
+    )
+    header_tpl = (
+        "Version:1.0\r\n"
+        "StartHTML:{sh}\r\n"
+        "EndHTML:{eh}\r\n"
+        "StartFragment:{sf}\r\n"
+        "EndFragment:{ef}\r\n"
+    )
+    prefix = "<html><body>\r\n<!--StartFragment-->"
+    suffix = "<!--EndFragment-->\r\n</body></html>"
+
+    # 偏移量按「字节」算，且必须用 10 位十进制占位符撑住宽度，否则数字变长会把自己挤歪
+    zeros = "0" * 10
+    start_html = len(header_tpl.format(sh=zeros, eh=zeros, sf=zeros, ef=zeros).encode("utf-8"))
+    start_frag = start_html + len(prefix.encode("utf-8"))
+    end_frag = start_frag + len(fragment.encode("utf-8"))
+    end_html = end_frag + len(suffix.encode("utf-8"))
+    header = header_tpl.format(
+        sh=f"{start_html:010d}", eh=f"{end_html:010d}",
+        sf=f"{start_frag:010d}", ef=f"{end_frag:010d}",
+    )
+    return (header + prefix + fragment + suffix).encode("utf-8")
+
+
+def _win_clipboard_write(items):
+    """把 [(格式ID, bytes)] 一次性写入 Windows 剪贴板（多格式互不覆盖）"""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    # 显式声明参数 / 返回类型：64 位下句柄超过 2^31，不声明会被截断成 32 位整数
+    # （同 DPAPI 那次 LocalFree 的坑），导致 SetClipboardData 拿到错误的句柄。
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+    user32.SetClipboardData.restype = wintypes.HANDLE
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = wintypes.HGLOBAL
+    kernel32.GlobalLock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+    kernel32.GlobalFree.restype = wintypes.HGLOBAL
+
+    # 剪贴板是全局独占资源：别的程序（Excel、输入法、截图工具）短暂占用很常见，重试几次
+    opened = False
+    for _ in range(10):
+        if user32.OpenClipboard(None):
+            opened = True
+            break
+        time.sleep(0.05)
+    if not opened:
+        raise OSError("剪贴板正被其他程序占用")
+
+    GMEM_MOVEABLE = 0x0002
+    try:
+        if not user32.EmptyClipboard():
+            raise OSError("清空剪贴板失败")
+        for fmt, data in items:
+            handle = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+            if not handle:
+                raise OSError("剪贴板内存分配失败")
+            ptr = kernel32.GlobalLock(handle)
+            if not ptr:
+                kernel32.GlobalFree(handle)
+                raise OSError("剪贴板内存锁定失败")
+            ctypes.memmove(ptr, data, len(data))
+            kernel32.GlobalUnlock(handle)
+            # 交给系统后所有权转移，不能再 GlobalFree
+            if not user32.SetClipboardData(fmt, handle):
+                kernel32.GlobalFree(handle)
+                raise OSError(f"写入剪贴板格式 {fmt} 失败")
+    finally:
+        user32.CloseClipboard()
+
+
+def set_clipboard(rows):
+    """把文字矩阵写入剪贴板（文本 + HTML 表格）；失败抛 OSError"""
+    tsv = "\r\n".join("\t".join(row) for row in rows)
+    if os.name != "nt":
+        import tkinter as tk
+        root = tk.Tk()
+        try:
+            root.withdraw()
+            root.clipboard_clear()
+            root.clipboard_append(tsv)
+            root.update()
+        finally:
+            root.destroy()
+        return
+
+    import ctypes
+    items = []
+    fmt_html = ctypes.windll.user32.RegisterClipboardFormatW("HTML Format")
+    if fmt_html:
+        items.append((fmt_html, _cf_html_document(rows)))
+    # 文本格式放最后写入（高保真格式优先），UTF-16LE + 结尾双字节 0
+    items.append((CLIPBOARD_CF_UNICODETEXT, tsv.encode("utf-16-le") + b"\x00\x00"))
+    _win_clipboard_write(items)
+
+
+def copy_xlsx_range_to_clipboard(xlsx_path, cell_range=None):
+    """把 xlsx 指定区域复制到剪贴板，返回状态字典（**不抛异常**）
+
+    剪贴板被占用 / 文件被 Excel 独占打开等都不影响已经生成的报表，
+    只记一条警告，由调用方决定是否提示。
+    """
+    cfg = load_settings()
+    if cell_range is None:
+        cell_range = cfg.get("clipboard_range") or CLIPBOARD_RANGE
+    info = {"ok": False, "range": cell_range, "rows": 0, "cols": 0, "error": ""}
+    if not cfg.get("clipboard_enabled", CLIPBOARD_ENABLED):
+        info["error"] = "已在设置中关闭"
+        return info
+    if not cell_range:
+        info["error"] = "未配置复制区域"
+        return info
+    try:
+        rows = read_xlsx_range(xlsx_path, cell_range)
+        if not rows or not rows[0]:
+            info["error"] = f"区域 {cell_range} 没有内容"
+            return info
+        set_clipboard(rows)
+    except Exception as e:
+        info["error"] = f"{type(e).__name__}: {e}"
+        return info
+    info.update(ok=True, rows=len(rows), cols=len(rows[0]))
+    return info
+
+
 def process_csv(path, out_folder, day):
     """CSV → 筛选/排序/去重 → xlsx，返回统计信息与输出路径"""
     import pandas as pd
     from openpyxl.utils import get_column_letter
 
+    cfg = load_settings()
     enc = detect_csv_encoding(path)
     header_df = pd.read_csv(path, nrows=0, encoding=enc)
     headers = list(header_df.columns)
@@ -1923,9 +2145,10 @@ def process_csv(path, out_folder, day):
 
     df = pd.read_csv(path, encoding=enc, converters=converters, keep_default_na=False)
 
-    # 筛选
+    # 筛选（条件来自设置页，默认「未封禁 + 无异常」）
     rows_before = len(df)
-    for col_key, val_key in FILTER_COLUMNS.items():
+    filters = cfg.get("filters") or dict(FILTER_COLUMNS)
+    for col_key, val_key in filters.items():
         col = find_col_by_keyword(df.columns, col_key)
         if col is None:
             _column_error(col_key, "筛选")
@@ -1933,17 +2156,18 @@ def process_csv(path, out_folder, day):
     rows_after_filter = len(df)
 
     # 排序
-    sort_col = find_col_by_keyword(df.columns, SORT_COLUMN_KEYWORD)
+    sort_col = find_col_by_keyword(df.columns, cfg.get("sort_keyword") or SORT_COLUMN_KEYWORD)
     if sort_col is None:
-        _column_error(SORT_COLUMN_KEYWORD, "排序")
+        _column_error(cfg.get("sort_keyword") or SORT_COLUMN_KEYWORD, "排序")
     df[sort_col] = pd.to_numeric(df[sort_col], errors="coerce")
-    df = df.sort_values(by=sort_col, ascending=False, na_position="last")
+    df = df.sort_values(by=sort_col, ascending=not cfg.get("sort_desc", True), na_position="last")
 
     # 去重
-    dedup_col = find_col_by_keyword(df.columns, DEDUP_COLUMN_KEYWORD)
+    dedup_key = cfg.get("dedup_keyword") or DEDUP_COLUMN_KEYWORD
+    dedup_col = find_col_by_keyword(df.columns, dedup_key)
     rows_before_dedup = len(df)
     if dedup_col is None:
-        _column_error(DEDUP_COLUMN_KEYWORD, "去重")
+        _column_error(dedup_key, "去重")
     df = df.drop_duplicates(subset=[dedup_col], keep="first")
     rows_after_dedup = len(df)
 
@@ -1980,6 +2204,16 @@ def process_csv(path, out_folder, day):
                 cell.alignment = center
         auto_fit_column_width(ws)
 
+    # 输出后直接把指定区域复制到剪贴板：不打开文件、不弹 Excel，复制完即可粘贴。
+    # 区域固定为 CLIPBOARD_RANGE（默认 C1:L11），数据不足时自动裁掉尾部空行空列。
+    clip = copy_xlsx_range_to_clipboard(out_path)
+    if clip["ok"]:
+        log(f"[剪贴板] 已复制 {clip['range']}（{clip['rows']} 行 × {clip['cols']} 列）"
+            f"到剪贴板，可直接粘贴到 Excel / 微信 / 文档。")
+    else:
+        log(f"[警告] 复制 {clip['range']} 到剪贴板未完成：{clip['error']}"
+            f"（报表已正常生成，可手动打开后复制）")
+
     return {
         "encoding": enc,
         "rows_before": rows_before,
@@ -1987,6 +2221,7 @@ def process_csv(path, out_folder, day):
         "rows_before_dedup": rows_before_dedup,
         "rows_after_dedup": rows_after_dedup,
         "out_path": out_path,
+        "clip": clip,
     }
 
 
@@ -1999,17 +2234,30 @@ class PipelineError(RuntimeError):
         self.stage = stage
 
 
-def run_pipeline(day):
-    """抓取 → CSV → 处理 → xlsx，返回结果字典（异常转 PipelineError）"""
+def run_pipeline(day, progress=None):
+    """抓取 → CSV → 处理 → xlsx，返回结果字典（异常转 PipelineError）
+
+    progress: 可选回调 progress(stage, done, total)，用于界面上的阶段进度：
+        ("fetch", 已抓条数, 总条数) / ("csv", 0, 0) / ("process", 0, 0) / ("clip", 0, 0)
+    """
     base = script_dir()
     csv_folder = os.path.join(base, "csv")
     xlsx_folder = os.path.join(base, "replay核查")
 
+    def _step(stage, done=0, total=0):
+        if progress:
+            try:
+                progress(stage, done, total)
+            except Exception:
+                pass
+
     log(f"===== 目标日期: {day} =====")
 
     # 1. 抓取
+    _step("fetch", 0, 0)
     try:
-        items, start_at, end_at = fetch_day(day)
+        items, start_at, end_at = fetch_day(
+            day, progress=lambda done, total: _step("fetch", done, total))
     except Exception as e:
         report_exception(e, stage="fetch", day=str(day))
         log(f"[错误] 抓取失败: {e}")
@@ -2019,6 +2267,7 @@ def run_pipeline(day):
         return {"status": "empty", "day": day, "start_at": start_at, "end_at": end_at}
 
     # 2. 导出 CSV
+    _step("csv")
     try:
         csv_path = write_csv(
             [item_to_row(it) for it in items],
@@ -2031,6 +2280,7 @@ def run_pipeline(day):
     log(f"[抓取完成] 共 {len(items)} 条 → {csv_path}")
 
     # 3. 处理文档
+    _step("process")
     try:
         stat = process_csv(csv_path, xlsx_folder, day)
     except Exception as e:
@@ -2038,6 +2288,7 @@ def run_pipeline(day):
         log(f"[错误] 处理失败: {e}")
         raise PipelineError("process", str(e))
 
+    _step("clip")
     log(f"[文档处理完成] {stat['out_path']}")
     return {
         "status": "ok",
@@ -2048,6 +2299,148 @@ def run_pipeline(day):
         "csv_path": csv_path,
         "stat": stat,
     }
+
+
+# ==================================================================
+#                    用户配置（.aireplay_config.json）
+# ==================================================================
+# 筛选 / 排序 / 去重 / 剪贴板这些「业务参数」以前写死在代码里，改一次要改代码 + 发版。
+# 现在在设置页可改，落到 exe 同目录的 .aireplay_config.json：
+#   · 文件不存在 → 全部用下面 DEFAULT_SETTINGS（与老版本行为完全一致，老用户零感知）
+#   · 文件损坏 / 字段缺失 → 缺什么补什么，不覆盖整个配置
+#   · 已加进 .gitignore，不进仓库
+CONFIG_NAME = ".aireplay_config.json"
+
+DEFAULT_SETTINGS = {
+    "filters": dict(FILTER_COLUMNS),          # {列名关键字: 期望值}
+    "sort_keyword": SORT_COLUMN_KEYWORD,
+    "sort_desc": True,
+    "dedup_keyword": DEDUP_COLUMN_KEYWORD,
+    "clipboard_enabled": CLIPBOARD_ENABLED,
+    "clipboard_range": CLIPBOARD_RANGE,
+    "popup_on_done": False,                   # 完成后弹结果窗（默认关：不打断粘贴）
+    "animations": True,                       # 界面动效（进度条平滑 / 数字滚动 / 状态呼吸）
+    "theme": "dark",
+    "history_limit": 80,
+}
+
+_SETTINGS_CACHE = None
+
+
+def settings_path():
+    return os.path.join(script_dir(), CONFIG_NAME)
+
+
+def load_settings(force=False):
+    """读取配置并与默认值合并；缓存于内存，避免每次处理都读盘"""
+    global _SETTINGS_CACHE
+    if _SETTINGS_CACHE is not None and not force:
+        return _SETTINGS_CACHE
+    cfg = json.loads(json.dumps(DEFAULT_SETTINGS))   # 深拷贝默认值
+    path = settings_path()
+    try:
+        if os.path.isfile(path):
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                if isinstance(data.get("filters"), dict) and data["filters"]:
+                    cfg["filters"] = {str(k): str(v) for k, v in data["filters"].items()}
+                for key in ("sort_keyword", "dedup_keyword", "clipboard_range", "theme"):
+                    if isinstance(data.get(key), str) and data[key].strip():
+                        cfg[key] = data[key].strip()
+                for key in ("sort_desc", "clipboard_enabled", "popup_on_done", "animations"):
+                    if isinstance(data.get(key), bool):
+                        cfg[key] = data[key]
+                if isinstance(data.get("history_limit"), int) and data["history_limit"] > 0:
+                    cfg["history_limit"] = data["history_limit"]
+    except Exception as e:
+        log(f"[警告] 配置文件读取失败，本次使用默认设置: {e}")
+    _SETTINGS_CACHE = cfg
+    return cfg
+
+
+def save_settings(patch):
+    """把 patch 合并进当前配置并写盘；返回合并后的配置（写盘失败只记日志）"""
+    global _SETTINGS_CACHE
+    cfg = load_settings()
+    cfg.update(patch or {})
+    _SETTINGS_CACHE = cfg
+    path = settings_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        log(f"[设置] 配置已保存: {path}")
+    except Exception as e:
+        log(f"[警告] 配置保存失败（本次仍按新设置运行）: {e}")
+    return cfg
+
+
+# ==================================================================
+#                     输出产物扫描（历史页 / 最近任务）
+# ==================================================================
+_OUTPUT_NAME_RE = None
+_ROW_COUNT_CACHE = {}
+
+
+def output_folder():
+    return os.path.join(script_dir(), "replay核查")
+
+
+def scan_outputs(limit=80, with_rows=False):
+    """扫描输出目录里的报表，按日期倒序返回 [{path, day, size, mtime, rows}]"""
+    global _OUTPUT_NAME_RE
+    if _OUTPUT_NAME_RE is None:
+        # 兼容「重命名保留旧文件」产生的 replay核查-20261118（旧-20261119_101010）.xlsx
+        _OUTPUT_NAME_RE = re.compile(r"^replay核查-(\d{8})")
+    folder = output_folder()
+    items = []
+    try:
+        names = os.listdir(folder)
+    except Exception:
+        return items
+    for name in names:
+        if not name.lower().endswith(".xlsx"):
+            continue
+        m = _OUTPUT_NAME_RE.match(name)
+        if not m:
+            continue
+        path = os.path.join(folder, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        items.append({
+            "path": path,
+            "day": m.group(1),
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+            "rows": _ROW_COUNT_CACHE.get((path, int(st.st_mtime))),
+        })
+    items.sort(key=lambda x: (x["day"], x["mtime"]), reverse=True)
+    return items[:limit] if limit else items
+
+
+def count_sheet_rows(path):
+    """报表有效行数（含表头）；读取失败返回 None。结果按 (路径, mtime) 缓存"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    key = (path, int(st.st_mtime))
+    if key in _ROW_COUNT_CACHE:
+        return _ROW_COUNT_CACHE[key]
+    try:
+        from openpyxl import load_workbook
+        wb = load_workbook(path, read_only=True, data_only=True)
+        try:
+            ws = wb.active
+            n = ws.max_row or 0
+        finally:
+            wb.close()
+    except Exception:
+        n = None
+    _ROW_COUNT_CACHE[key] = n
+    return n
 
 
 # ==================================================================
@@ -2070,6 +2463,15 @@ CLR = {
     "ghost":    ("#ECF0F7", "#222731"),
     "ghost_h":  ("#DFE6F2", "#2B313D"),
     "log_bg":   ("#FAFBFD", "#0B0D11"),
+    # ---- 双栏工作台新增 ----
+    "side":      ("#F7F8FC", "#0D1014"),   # 左侧导航底色
+    "nav_hover": ("#EDF1F9", "#1A1E26"),
+    "nav_on":    ("#E7EEFF", "#1B2537"),   # 当前页
+    "tile":      ("#F7F8FC", "#151920"),   # 统计块
+    "stripe":    ("#F6F8FC", "#141821"),   # 预览表隔行
+    "ok_bg":     ("#ECFDF3", "#0E2A1E"),   # 已复制条
+    "ok_line":   ("#A7F3D0", "#14532D"),
+    "ok_text":   ("#15803D", "#6EE7B7"),
 }
 OK_CLR, WARN_CLR, ERR_CLR, RUN_CLR = "#22C55E", "#F59E0B", "#EF4444", "#3B82F6"
 
@@ -2087,7 +2489,9 @@ if ctk is not None:
             self.title("核查完成" if ok else "无数据")
             self.configure(fg_color=CLR["win"])
             self.resizable(False, False)
-            self.geometry("640x420")
+            # 高度按内容给足：7 行统计 + 输出文件框 + 底部按钮，实测内容约需 500px，
+            # 卡在 470 会把「打开目录 / 再次复制 / 关闭」压成一条缝（按钮被裁掉）。
+            self.geometry("640x540")
 
             f_title = ctk.CTkFont(family=FONT_UI, size=19, weight="bold")
             f_key = ctk.CTkFont(family=FONT_UI, size=12)
@@ -2107,6 +2511,14 @@ if ctk is not None:
             body.grid_columnconfigure(1, weight=1)
 
             if ok:
+                clip = stat.get("clip") or {}
+                if clip.get("ok"):
+                    clip_text = (f"{clip.get('range')}（{clip.get('rows')} 行 × "
+                                 f"{clip.get('cols')} 列）已自动复制")
+                elif clip.get("error"):
+                    clip_text = f"未复制（{clip.get('error')}）"
+                else:
+                    clip_text = "未启用"
                 rows = [
                     ("抓取日期", res.get("day", "")),
                     ("抓取范围", f"{res.get('start_at','')}  ~  {res.get('end_at','')}"),
@@ -2116,6 +2528,7 @@ if ctk is not None:
                     ("去重结果", f"{stat.get('rows_before_dedup', 0)}  →  {stat.get('rows_after_dedup', 0)} 行"
                                  f"（按角色ID）"),
                     ("排序方式", "按分数降序"),
+                    ("剪贴板", clip_text),
                 ]
             else:
                 rows = [
@@ -2127,7 +2540,7 @@ if ctk is not None:
                 ctk.CTkLabel(body, text=k, font=f_key, text_color=CLR["sub"]).grid(
                     row=i, column=0, sticky="w", padx=(20, 16), pady=(14 if i == 0 else 7, 0))
                 ctk.CTkLabel(body, text=v, font=f_val, text_color=CLR["text"], anchor="w",
-                             justify="left").grid(
+                             justify="left", wraplength=430).grid(
                     row=i, column=1, sticky="w", padx=(0, 20), pady=(14 if i == 0 else 7, 0))
 
             out_path = stat.get("out_path") or res.get("csv_path") or ""
@@ -2150,6 +2563,17 @@ if ctk is not None:
                     fg_color=CLR["accent"], hover_color=CLR["accent_h"], text_color="#FFFFFF",
                     command=lambda p=os.path.dirname(out_path): self._open(p),
                 ).pack(side="left")
+            # 复制是「主动动作」，粘贴前想再取一次时不用重新跑一遍抓取
+            self._out_path = out_path
+            self._btn_clip = None
+            if out_path and CLIPBOARD_ENABLED and CLIPBOARD_RANGE:
+                self._btn_clip = ctk.CTkButton(
+                    foot, text=f"再次复制 {CLIPBOARD_RANGE}", width=160, height=40,
+                    corner_radius=10, font=ctk.CTkFont(family=FONT_UI, size=13),
+                    fg_color=CLR["ghost"], hover_color=CLR["ghost_h"], text_color=CLR["text"],
+                    command=self._copy_again,
+                )
+                self._btn_clip.pack(side="left", padx=(10, 0))
             ctk.CTkButton(
                 foot, text="关闭", width=100, height=40, corner_radius=10,
                 font=ctk.CTkFont(family=FONT_UI, size=13),
@@ -2180,6 +2604,20 @@ if ctk is not None:
                 open_folder(path)
             except Exception as e:
                 log(f"[警告] 打开目录失败: {e}")
+
+        def _copy_again(self):
+            """按当前报表重新复制一次指定区域（区域内容固定，不重新抓取）"""
+            clip = copy_xlsx_range_to_clipboard(self._out_path)
+            if not (clip["ok"] and self._btn_clip is not None):
+                log(f"[警告] 复制 {clip['range']} 到剪贴板失败：{clip['error']}")
+                return
+            log(f"[剪贴板] 已复制 {clip['range']}（{clip['rows']} 行 × {clip['cols']} 列）到剪贴板。")
+            try:
+                self._btn_clip.configure(text="已复制 ✓")
+                self.after(1600, lambda: self._btn_clip.configure(
+                    text=f"再次复制 {CLIPBOARD_RANGE}"))
+            except Exception:
+                pass
 
     class LoginDialog(ctk.CTkToplevel):
         """登录对话框（深色）：账号 + 密码（掩码）+ LDAP 复选（默认不勾选）
@@ -2496,18 +2934,6 @@ if ctk is not None:
             except Exception:
                 pass
 
-        def _on_stage(self, idx, lines):
-            """换到第 idx 条下载线路：记下行号，状态行给一句中性提示。
-
-            文案里不含任何地址 / 平台名，只告诉用户「正在自动换条路重试」。
-            """
-            try:
-                self._line, self._lines = idx, lines
-                self.lbl_msg.configure(
-                    text=f"当前线路不顺畅，正在自动切换（第 {idx}/{lines} 条）…")
-            except Exception:
-                pass
-
         def _on_error(self, msg):
             self._busy = False
             # 失败原因也过一遍清洗：日志区、状态行与弹窗里都不出现仓库地址 / 下载引导
@@ -2545,17 +2971,130 @@ if ctk is not None:
             log(f"[更新] 已启动新版本，当前程序即将退出: {path}")
             self.app.after(700, self.app._quit_for_update)
 
+    class DatePickerPopup(ctk.CTkToplevel):
+        """日期选择弹层（自绘月历，不引入第三方 datepicker）"""
+
+        WEEK = ("一", "二", "三", "四", "五", "六", "日")
+
+        def __init__(self, master, anchor, day="", on_pick=None):
+            super().__init__(master)
+            self._on_pick = on_pick
+            try:
+                self._sel = datetime.strptime(day, "%Y%m%d")
+            except Exception:
+                self._sel = datetime.now()
+            self._shown = self._sel.replace(day=1)
+
+            self.overrideredirect(True)          # 无标题栏，像一个下拉层
+            self.configure(fg_color=CLR["card"])
+            self.attributes("-topmost", True)
+
+            self.f_small = ctk.CTkFont(family=FONT_UI, size=11)
+            self.f_month = ctk.CTkFont(family=FONT_UI, size=13, weight="bold")
+
+            head = ctk.CTkFrame(self, fg_color="transparent")
+            head.pack(fill="x", padx=10, pady=(10, 4))
+            ctk.CTkButton(head, text="‹", width=26, height=26, corner_radius=7,
+                          font=self.f_small, fg_color="transparent", hover_color=CLR["ghost"],
+                          text_color=CLR["text"], command=lambda: self._shift(-1)).pack(side="left")
+            self.lbl_month = ctk.CTkLabel(head, text="", font=self.f_month, text_color=CLR["text"])
+            self.lbl_month.pack(side="left", expand=True)
+            ctk.CTkButton(head, text="›", width=26, height=26, corner_radius=7,
+                          font=self.f_small, fg_color="transparent", hover_color=CLR["ghost"],
+                          text_color=CLR["text"], command=lambda: self._shift(1)).pack(side="right")
+
+            self.grid_box = ctk.CTkFrame(self, fg_color="transparent")
+            self.grid_box.pack(padx=10, pady=(0, 6))
+
+            foot = ctk.CTkFrame(self, fg_color="transparent")
+            foot.pack(fill="x", padx=10, pady=(0, 10))
+            ctk.CTkButton(foot, text="今天", width=64, height=28, corner_radius=8,
+                          font=self.f_small, fg_color=CLR["ghost"], hover_color=CLR["ghost_h"],
+                          text_color=CLR["text"],
+                          command=lambda: self._pick(date.today())).pack(side="left")
+            ctk.CTkButton(foot, text="取消", width=56, height=28, corner_radius=8,
+                          font=self.f_small, fg_color="transparent", hover_color=CLR["ghost"],
+                          text_color=CLR["sub"], command=self.destroy).pack(side="right")
+
+            self._render()
+            self.bind("<Escape>", lambda _e: self.destroy())
+            self.after(10, lambda: self._place(anchor))
+            self.after(20, self._grab)
+
+        def _grab(self):
+            try:
+                self.grab_set()
+            except Exception:
+                pass
+            self.focus_force()
+
+        def _place(self, anchor):
+            try:
+                self.update_idletasks()
+                x = anchor.winfo_rootx()
+                y = anchor.winfo_rooty() + anchor.winfo_height() + 6
+                sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+                w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+                x = max(0, min(x, sw - w - 8))
+                if y + h > sh:
+                    y = anchor.winfo_rooty() - h - 6
+                self.geometry(f"+{x}+{y}")
+            except Exception:
+                pass
+
+        def _shift(self, delta):
+            y, m = self._shown.year, self._shown.month + delta
+            if m < 1:
+                y, m = y - 1, 12
+            elif m > 12:
+                y, m = y + 1, 1
+            self._shown = self._shown.replace(year=y, month=m)
+            self._render()
+
+        def _pick(self, d):
+            try:
+                if self._on_pick:
+                    self._on_pick(d.strftime("%Y%m%d"))
+            finally:
+                self.destroy()
+
+        def _render(self):
+            for w in self.grid_box.winfo_children():
+                w.destroy()
+            y, m = self._shown.year, self._shown.month
+            self.lbl_month.configure(text=f"{y} 年 {m} 月")
+            for i, wd in enumerate(self.WEEK):
+                ctk.CTkLabel(self.grid_box, text=wd, width=34, font=self.f_small,
+                             text_color=CLR["sub"]).grid(row=0, column=i, padx=1, pady=(0, 2))
+            today = date.today()
+            for r, week in enumerate(calendar.monthcalendar(y, m), start=1):
+                for c, d in enumerate(week):
+                    if not d:
+                        continue
+                    is_sel = (d == self._sel.day and m == self._sel.month and y == self._sel.year)
+                    is_today = (d == today.day and m == today.month and y == today.year)
+                    ctk.CTkButton(
+                        self.grid_box, text=str(d), width=34, height=28, corner_radius=7,
+                        font=self.f_small,
+                        fg_color=CLR["accent"] if is_sel else ("transparent"),
+                        hover_color=CLR["accent_h"] if is_sel else CLR["ghost"],
+                        text_color="#FFFFFF" if is_sel else (CLR["accent"] if is_today else CLR["text"]),
+                        border_width=0 if (is_sel or not is_today) else 1,
+                        border_color=CLR["accent"],
+                        command=lambda dd=d: self._pick(date(y, m, dd)),
+                    ).grid(row=r, column=c, padx=1, pady=1)
+
     class ReplayApp(ctk.CTk):
-        """主窗口"""
+        """主窗口：左侧导航 + 右侧「工作台 / 历史记录 / 设置」三个页面"""
+
+        STAGE_ORDER = ("fetch", "csv", "process", "clip")
+        STAGE_TEXT = {"fetch": "抓取", "csv": "导出", "process": "处理", "clip": "复制"}
 
         def __init__(self, selfcheck=False):
             global _LOG_SINK, _LOGIN_UI
             super().__init__()
 
-            # 授权校验出结果之前先把窗口藏起来。
-            # 否则主界面会在「校验还没回来」的时候就已经显示出来：网络慢时能有好几十秒，
-            # 期间界面看着完全正常（能选日期、能点按钮），很容易误判成「授权没生效也能用」。
-            # 校验通过 → _reveal_for_license() 显示窗口；校验失败 → 程序直接退出，窗口自始至终不出现。
+            # 授权校验出结果之前先把窗口藏起来（否则网络慢时界面会先露出来几十秒）
             self._ui_hidden = bool(LICENSE_ENABLED) and not selfcheck
             if self._ui_hidden:
                 self.withdraw()
@@ -2563,50 +3102,66 @@ if ctk is not None:
             self._q = queue.Queue()
             self._running = False
             self._update_dialog = None
+            self._cfg = load_settings(force=True)
+            self._page = "work"
+            self._nav = {}
+            self._pages = {}
+            self._preview_rows = []
+            self._preview_range = self._cfg.get("clipboard_range") or CLIPBOARD_RANGE
+            self._last_out = ""
+            self._hist_rows = {}
+            self._last_day = ""
+
+            # 动效状态：_tweens 存各条补间动画的 after id，同一 key 后来的会顶掉先前的
+            self._tweens = {}
+            self._progress_val = 0.0
+            self._pill_busy = False
+
             self._day_default = (date.today() - timedelta(days=1)).strftime("%Y%m%d")
-            # 授权校验：全程在后台静默进行，界面不展示任何相关信息
-            self._license_ok = not LICENSE_ENABLED   # 关闭授权校验时视为已通过
+
+            self._license_ok = not LICENSE_ENABLED
             self._license_pending = bool(LICENSE_ENABLED)
             self._license_info = None
             self._license_guard = None
-            self._pending_day = None                 # 校验完成前点过「开始」则先暂存，通过后自动继续
+            self._pending_day = None
 
+            ctk.set_appearance_mode("dark" if self._cfg.get("theme") == "dark" else "light")
             self.title(f"{APP_TITLE}  v{current_app_version()}")
             self.configure(fg_color=CLR["win"])
-            self.geometry(self._center_geometry(900, 720))
-            self.minsize(840, 640)
+            self.geometry(self._center_geometry(1180, 800))
+            self.minsize(1080, 720)
 
-            self.f_h1 = ctk.CTkFont(family=FONT_UI, size=23, weight="bold")
-            self.f_sub = ctk.CTkFont(family=FONT_UI, size=12)
+            self.f_h1 = ctk.CTkFont(family=FONT_UI, size=22, weight="bold")
+            self.f_h2 = ctk.CTkFont(family=FONT_UI, size=15, weight="bold")
             self.f_sec = ctk.CTkFont(family=FONT_UI, size=13, weight="bold")
-            self.f_btn = ctk.CTkFont(family=FONT_UI, size=14, weight="bold")
+            self.f_sub = ctk.CTkFont(family=FONT_UI, size=12)
+            self.f_small = ctk.CTkFont(family=FONT_UI, size=11)
             self.f_body = ctk.CTkFont(family=FONT_UI, size=12)
-            self.f_entry = ctk.CTkFont(family="Consolas", size=15)
-            self.f_log = ctk.CTkFont(family="Consolas", size=12)
-            self.f_status = ctk.CTkFont(family=FONT_UI, size=12, weight="bold")
+            self.f_btn = ctk.CTkFont(family=FONT_UI, size=13, weight="bold")
+            self.f_num = ctk.CTkFont(family=FONT_UI, size=20, weight="bold")
+            self.f_entry = ctk.CTkFont(family="Consolas", size=13)
+            self.f_pv = ctk.CTkFont(family=FONT_UI, size=11)
+            self.f_log = ctk.CTkFont(family="Consolas", size=11)
 
-            self.grid_columnconfigure(0, weight=1)
-            self.grid_rowconfigure(3, weight=1)
-            self._build_header()
-            self._build_settings()
-            self._build_actions()
-            self._build_log()
-            self._build_footer()
+            self.grid_columnconfigure(1, weight=1)
+            self.grid_rowconfigure(0, weight=1)
+
+            self._build_sidebar()
+            self._build_body()
+            self._show_page("work")
+            self._refresh_recent()
+            self._render_preview([], self._preview_range)
 
             self.protocol("WM_DELETE_WINDOW", self._on_close)
             _LOG_SINK = lambda text: self._q.put(("log", text))
-            _LOGIN_UI = self._ask_login_threadsafe  # 注册登录框入口（抓取线程经此回到主线程弹框）
+            _LOGIN_UI = self._ask_login_threadsafe
             self._append_log(f"{datetime.now():%H:%M:%S}  界面已就绪，默认抓取日期 {self._day_default}")
             self.after(80, self._drain)
             threading.Thread(target=self._preheat, daemon=True).start()
-            # 打开即在后台静默校验授权（自检模式跳过，避免打包自检依赖网络）
-            # 界面不显示任何校验状态、也不改变按钮外观；未通过时程序会自行退出
             if not selfcheck:
                 self.after(120, self._start_license_check)
-            # 更新检查不在这里发起：必须等授权通过后再做，
-            # 否则「发现新版本」弹窗会在授权还没出结果时就冒出来（与「启动期无界面」矛盾）
 
-        # ---------------- 布局 ----------------
+        # ---------------- 基础 ----------------
         def _center_geometry(self, w, h):
             try:
                 sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
@@ -2614,132 +3169,688 @@ if ctk is not None:
             except Exception:
                 return f"{w}x{h}"
 
-        def _build_header(self):
-            bar = ctk.CTkFrame(self, fg_color="transparent")
-            bar.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 12))
-            bar.grid_columnconfigure(0, weight=1)
+        def _pal(self, key):
+            """取当前外观下的具体色值（给 tk 原生控件用）"""
+            value = CLR[key]
+            try:
+                return value[0] if ctk.get_appearance_mode() == "Light" else value[1]
+            except Exception:
+                return value[0]
 
-            left = ctk.CTkFrame(bar, fg_color="transparent")
-            left.grid(row=0, column=0, sticky="w")
-            ctk.CTkLabel(left, text=APP_TITLE, font=self.f_h1,
-                         text_color=CLR["text"]).grid(row=0, column=0, sticky="w")
-            ctk.CTkLabel(left, text="自动抓取  →  CSV 导出  →  筛选去重  →  Excel 报表",
-                         font=self.f_sub, text_color=CLR["sub"]).grid(row=1, column=0, sticky="w", pady=(3, 0))
+        # ---------------- 左侧导航 ----------------
+        def _build_sidebar(self):
+            bar = ctk.CTkFrame(self, width=216, corner_radius=0, fg_color=CLR["side"])
+            bar.grid(row=0, column=0, sticky="nsw")
+            bar.grid_propagate(False)
+            bar.pack_propagate(False)      # 子控件是 pack 的，必须禁 pack 传播才是固定宽度
 
-            right = ctk.CTkFrame(bar, fg_color="transparent")
-            right.grid(row=0, column=1, sticky="e")
+            brand = ctk.CTkFrame(bar, fg_color="transparent")
+            brand.pack(fill="x", padx=18, pady=(20, 16))
+            logo = ctk.CTkFrame(brand, width=34, height=34, corner_radius=10, fg_color=CLR["accent"])
+            logo.pack(side="left")
+            logo.pack_propagate(False)
+            ctk.CTkLabel(logo, text="AI", font=ctk.CTkFont(family=FONT_UI, size=12, weight="bold"),
+                         text_color="#FFFFFF").pack(expand=True)
+            box = ctk.CTkFrame(brand, fg_color="transparent")
+            box.pack(side="left", padx=(10, 0))
+            ctk.CTkLabel(box, text="AIReplay", font=self.f_h2, text_color=CLR["text"]).pack(anchor="w")
+            ctk.CTkLabel(box, text="Replay 核查", font=self.f_small,
+                         text_color=CLR["sub"]).pack(anchor="w")
+
+            for key, text in (("work", "工作台"), ("history", "历史记录"), ("settings", "设置")):
+                self._nav_item(bar, key, text)
+
+            ctk.CTkFrame(bar, height=1, fg_color=CLR["line"]).pack(fill="x", padx=18, pady=(14, 10))
+            ctk.CTkLabel(bar, text="最近任务", font=self.f_small,
+                         text_color=CLR["sub"]).pack(anchor="w", padx=20)
+            self.recent_box = ctk.CTkFrame(bar, fg_color="transparent")
+            self.recent_box.pack(fill="x", padx=14, pady=(4, 0))
+
+            bottom = ctk.CTkFrame(bar, fg_color="transparent")
+            bottom.pack(side="bottom", fill="x", padx=16, pady=(0, 16))
             self.seg_theme = ctk.CTkSegmentedButton(
-                right, values=["深色", "浅色"], width=128, height=30, font=self.f_body,
-                command=self._switch_theme, selected_color=CLR["accent"],
+                bottom, values=["深色", "浅色"], height=28, font=self.f_small,
+                command=self._on_theme_change, selected_color=CLR["accent"],
                 selected_hover_color=CLR["accent_h"], unselected_color=CLR["ghost"],
                 unselected_hover_color=CLR["ghost_h"], text_color=CLR["text"],
             )
-            self.seg_theme.set("深色")
-            self.seg_theme.grid(row=0, column=0, padx=(0, 12))
-            self.lbl_status = ctk.CTkLabel(right, text="●  就绪", font=self.f_status, width=104,
-                                           height=30, corner_radius=15, fg_color=CLR["ghost"],
-                                           text_color=CLR["sub"])
-            self.lbl_status.grid(row=0, column=1)
+            self.seg_theme.set("深色" if self._cfg.get("theme") == "dark" else "浅色")
+            self.seg_theme.pack(fill="x")
+            self.btn_check = ctk.CTkButton(
+                bottom, text="检查更新", height=28, corner_radius=8, font=self.f_small,
+                fg_color="transparent", hover_color=CLR["ghost"], text_color=CLR["sub"],
+                command=lambda: self._check_update(manual=True))
+            self.btn_check.pack(fill="x", pady=(8, 4))
+            ctk.CTkLabel(bottom, text=f"v{current_app_version()}", font=self.f_small,
+                         text_color=CLR["sub"]).pack(anchor="w")
 
-        def _build_settings(self):
-            card = ctk.CTkFrame(self, fg_color=CLR["card"], corner_radius=14,
+        def _nav_item(self, parent, key, text):
+            row = ctk.CTkFrame(parent, height=38, corner_radius=9, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=2)
+            row.pack_propagate(False)
+            mark = ctk.CTkFrame(row, width=3, height=18, corner_radius=2, fg_color="transparent")
+            mark.pack(side="left", padx=(8, 10))
+            lbl = ctk.CTkLabel(row, text=text, font=self.f_body, text_color=CLR["text"], anchor="w")
+            lbl.pack(side="left", fill="both", expand=True)
+            for w in (row, lbl):
+                w.bind("<Button-1>", lambda _e, k=key: self._show_page(k))
+                w.bind("<Enter>", lambda _e, r=row, k=key: self._nav_hover(r, k, True))
+                w.bind("<Leave>", lambda _e, r=row, k=key: self._nav_hover(r, k, False))
+            self._nav[key] = (row, mark, lbl)
+
+        def _nav_hover(self, row, key, entering):
+            if self._page == key:
+                return
+            row.configure(fg_color=CLR["nav_hover"] if entering else "transparent")
+
+        def _paint_nav(self):
+            for key, (row, mark, lbl) in self._nav.items():
+                on = key == self._page
+                row.configure(fg_color=CLR["nav_on"] if on else "transparent")
+                mark.configure(fg_color=CLR["accent"] if on else "transparent")
+                lbl.configure(text_color=CLR["accent"] if on else CLR["text"])
+
+        def _show_page(self, key):
+            """切页：三页常驻叠放，只靠 lift 换前后景。
+
+            不 unmap/map（grid_remove + grid 重新映射一个百来控件的页面实测 1.6~2.0 秒），
+            也不做位移补间 —— 切页就是瞬时切换，只有数据变化时才有动效。"""
+            self._page = key
+            if key == "history":
+                self._refresh_history()
+            elif key == "settings":
+                self._load_settings_into_form()
+
+            # 三页在 _build_body 里就已经 place 满了整个 body，这里只换前后景，
+            # 不要重复 place：对一个已就位的页面再 place 一次会让整个页面重排（实测 20ms+）
+            self._pages[key].lift()
+            self._paint_nav()
+
+        # ---------------- 页面容器 ----------------
+        def _build_body(self):
+            self.body = ctk.CTkFrame(self, fg_color="transparent")
+            self.body.grid(row=0, column=1, sticky="nsew")
+            self.body.grid_columnconfigure(0, weight=1)
+            self.body.grid_rowconfigure(0, weight=1)
+            for key, builder in (("work", self._build_work_page),
+                                 ("history", self._build_history_page),
+                                 ("settings", self._build_settings_page)):
+                page = builder()
+                page.place(x=0, y=0, relwidth=1, relheight=1)
+                self._pages[key] = page
+
+        # ---------------- 工作台 ----------------
+        def _build_work_page(self):
+            # 三个页面常驻显示、靠 lift 叠放，切换时不做 map/unmap：
+            # 每次重新映射这一百多个控件要花上百毫秒，切页会明显卡一下
+            page = ctk.CTkFrame(self.body, fg_color=CLR["win"])
+            page.grid_columnconfigure(0, weight=1)
+            page.grid_rowconfigure(4, weight=1)      # 预览区吃掉剩余高度
+
+            head = ctk.CTkFrame(page, fg_color="transparent")
+            head.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 12))
+            head.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(head, text="核查工作台", font=self.f_h1,
+                         text_color=CLR["text"]).grid(row=0, column=0, sticky="w")
+            ctk.CTkLabel(head, text="选日期 → 抓取 → 导出 → 去重 → 复制到剪贴板",
+                         font=self.f_sub, text_color=CLR["sub"]).grid(row=1, column=0, sticky="w", pady=(3, 0))
+            self.lbl_status = ctk.CTkLabel(head, text="●  就绪", font=self.f_small, width=96, height=28,
+                                           corner_radius=14, fg_color=CLR["ghost"], text_color=CLR["sub"])
+            self.lbl_status.grid(row=0, column=1, rowspan=2, sticky="e")
+
+            # 任务条
+            task = ctk.CTkFrame(page, fg_color=CLR["card"], corner_radius=14,
                                 border_width=1, border_color=CLR["line"])
-            card.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 12))
-            card.grid_columnconfigure(4, weight=1)
-
-            ctk.CTkLabel(card, text="抓取日期", font=self.f_sec,
-                         text_color=CLR["text"]).grid(row=0, column=0, sticky="w",
-                                                      padx=(20, 12), pady=(18, 18))
-            self.entry_day = ctk.CTkEntry(card, width=150, height=38, font=self.f_entry,
-                                          corner_radius=9, justify="center",
+            task.grid(row=1, column=0, sticky="ew", padx=24)
+            row = ctk.CTkFrame(task, fg_color="transparent")
+            row.pack(fill="x", padx=16, pady=(14, 8))
+            ctk.CTkLabel(row, text="抓取日期", font=self.f_body,
+                         text_color=CLR["sub"]).pack(side="left", padx=(0, 10))
+            self.entry_day = ctk.CTkEntry(row, width=118, height=34, font=self.f_entry,
+                                          corner_radius=8, justify="center",
                                           fg_color=CLR["log_bg"], border_color=CLR["line"],
                                           text_color=CLR["text"])
-            self.entry_day.grid(row=0, column=1, padx=(0, 14), pady=(18, 18))
+            self.entry_day.pack(side="left")
             self.entry_day.insert(0, self._day_default)
+            for text, off in (("昨天", 1), ("今天", 0), ("前天", 2)):
+                ctk.CTkButton(row, text=text, width=52, height=34, corner_radius=8, font=self.f_small,
+                              fg_color=CLR["ghost"], hover_color=CLR["ghost_h"], text_color=CLR["text"],
+                              command=lambda o=off: self._set_quick_day(o)).pack(side="left", padx=(8, 0))
+            self.btn_cal = ctk.CTkButton(row, text="日历", width=56, height=34, corner_radius=8,
+                                         font=self.f_small, fg_color=CLR["ghost"],
+                                         hover_color=CLR["ghost_h"], text_color=CLR["text"],
+                                         command=self._open_calendar)
+            self.btn_cal.pack(side="left", padx=(8, 0))
 
-            quick = ctk.CTkFrame(card, fg_color="transparent")
-            quick.grid(row=0, column=2, sticky="w", pady=(18, 18))
-            for i, (text, off) in enumerate([("昨天", 1), ("今天", 0), ("前天", 2)]):
-                ctk.CTkButton(quick, text=text, width=66, height=32, corner_radius=8,
-                              font=self.f_body, fg_color=CLR["ghost"], hover_color=CLR["ghost_h"],
-                              text_color=CLR["text"],
-                              command=lambda o=off: self._set_quick_day(o)).grid(
-                    row=0, column=i, padx=(0, 8))
+            self.btn_open = ctk.CTkButton(row, text="打开目录", width=96, height=34, corner_radius=8,
+                                          font=self.f_small, fg_color=CLR["ghost"],
+                                          hover_color=CLR["ghost_h"], text_color=CLR["text"],
+                                          command=self._open_output_folder)
+            self.btn_open.pack(side="right")
+            self.btn_start = ctk.CTkButton(row, text="开始核查", width=126, height=38, corner_radius=9,
+                                           font=self.f_btn, fg_color=CLR["accent"],
+                                           hover_color=CLR["accent_h"], text_color="#FFFFFF",
+                                           command=self._on_start)
+            self.btn_start.pack(side="right", padx=(0, 10))
 
-            ctk.CTkLabel(card, text="格式 YYYYMMDD，默认抓取昨天", font=self.f_sub,
-                         text_color=CLR["sub"]).grid(row=0, column=4, sticky="e",
-                                                     padx=(0, 20), pady=(18, 18))
+            stages = ctk.CTkFrame(task, fg_color="transparent")
+            stages.pack(fill="x", padx=16, pady=(0, 8))
+            self._stage_lbl = {}
+            for i, key in enumerate(self.STAGE_ORDER):
+                if i:
+                    ctk.CTkLabel(stages, text="›", font=self.f_small,
+                                 text_color=CLR["sub"]).pack(side="left", padx=6)
+                lbl = ctk.CTkLabel(stages, text=self.STAGE_TEXT[key], font=self.f_small,
+                                   text_color=CLR["sub"])
+                lbl.pack(side="left")
+                self._stage_lbl[key] = lbl
+            self.lbl_stage_note = ctk.CTkLabel(stages, text="", font=self.f_small,
+                                               text_color=CLR["sub"])
+            self.lbl_stage_note.pack(side="right")
 
-        def _build_actions(self):
-            act = ctk.CTkFrame(self, fg_color="transparent")
-            act.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 12))
-            self.btn_start = ctk.CTkButton(
-                act, text="开始抓取并处理", width=208, height=46, corner_radius=11,
-                font=self.f_btn, fg_color=CLR["accent"], hover_color=CLR["accent_h"],
-                text_color="#FFFFFF", command=self._on_start,
-            )
-            self.btn_start.grid(row=0, column=0)
-            ctk.CTkButton(act, text="打开输出目录", width=140, height=46, corner_radius=11,
-                          font=self.f_body, fg_color=CLR["ghost"], hover_color=CLR["ghost_h"],
-                          text_color=CLR["text"],
-                          command=self._open_output_folder).grid(row=0, column=1, padx=(12, 0))
-            self.btn_check = ctk.CTkButton(
-                act, text="检查更新", width=118, height=46, corner_radius=11,
-                font=self.f_body, fg_color=CLR["ghost"], hover_color=CLR["ghost_h"],
-                text_color=CLR["text"],
-                command=lambda: self._check_update(manual=True),
-            )
-            self.btn_check.grid(row=0, column=2, padx=(12, 0))
+            # 细进度条：空闲时静止，运行时来回滚动（indeterminate）
+            self.progress = ctk.CTkProgressBar(task, height=4, corner_radius=2,
+                                               fg_color=CLR["ghost"],
+                                               progress_color=CLR["accent"])
+            self.progress.set(0)
+            self.progress.pack(fill="x", padx=16, pady=(0, 12))
 
-        def _build_log(self):
-            box = ctk.CTkFrame(self, fg_color=CLR["card"], corner_radius=14,
-                               border_width=1, border_color=CLR["line"])
-            box.grid(row=3, column=0, sticky="nsew", padx=24, pady=(0, 12))
-            box.grid_columnconfigure(0, weight=1)
-            box.grid_rowconfigure(1, weight=1)
+            # 统计
+            tiles = ctk.CTkFrame(page, fg_color="transparent")
+            tiles.grid(row=2, column=0, sticky="ew", padx=24, pady=(12, 0))
+            self._stat = {}
+            for i, (key, label) in enumerate((("fetch", "抓取条数"), ("filter", "筛选后"),
+                                              ("dedup", "去重后"))):
+                tiles.grid_columnconfigure(i, weight=1)
+                tile = ctk.CTkFrame(tiles, fg_color=CLR["tile"], corner_radius=12)
+                tile.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 10, 0))
+                ctk.CTkLabel(tile, text=label, font=self.f_small,
+                             text_color=CLR["sub"]).pack(anchor="w", padx=16, pady=(11, 0))
+                value = ctk.CTkLabel(tile, text="—", font=self.f_num, text_color=CLR["text"])
+                value.pack(anchor="w", padx=16, pady=(0, 10))
+                self._stat[key] = value
 
-            head = ctk.CTkFrame(box, fg_color="transparent")
-            head.grid(row=0, column=0, sticky="ew", padx=18, pady=(14, 8))
+            # 已复制提示条（成功后出现）
+            self.clip_bar = ctk.CTkFrame(page, fg_color=CLR["ok_bg"], corner_radius=10,
+                                         border_width=1, border_color=CLR["ok_line"])
+            self.clip_bar.grid(row=3, column=0, sticky="ew", padx=24, pady=(10, 0))
+            self.clip_lbl = ctk.CTkLabel(self.clip_bar, text="", font=self.f_body, text_color=CLR["ok_text"])
+            self.clip_lbl.pack(side="left", padx=16, pady=9)
+            ctk.CTkButton(self.clip_bar, text="再次复制", width=84, height=26, corner_radius=7,
+                          font=self.f_small, fg_color="transparent", border_width=1,
+                          border_color=CLR["ok_line"], hover_color=CLR["ok_bg"],
+                          text_color=CLR["ok_text"], command=self._copy_again).pack(side="right", padx=10)
+            self.clip_bar.grid_remove()
+
+            self._build_preview(page)
+            self._build_log(page)
+            return page
+
+        def _build_preview(self, page):
+            card = ctk.CTkFrame(page, fg_color=CLR["card"], corner_radius=14,
+                                border_width=1, border_color=CLR["line"])
+            card.grid(row=4, column=0, sticky="nsew", padx=24, pady=(12, 0))
+            card.grid_columnconfigure(0, weight=1)
+            card.grid_rowconfigure(1, weight=1)
+
+            head = ctk.CTkFrame(card, fg_color="transparent")
+            head.grid(row=0, column=0, sticky="ew", padx=16, pady=(10, 6))
             head.grid_columnconfigure(0, weight=1)
-            ctk.CTkLabel(head, text="运行日志", font=self.f_sec,
+            ctk.CTkLabel(head, text="复制内容预览", font=self.f_sec,
                          text_color=CLR["text"]).grid(row=0, column=0, sticky="w")
-            ctk.CTkButton(head, text="清空", width=58, height=26, corner_radius=7, font=self.f_body,
-                          fg_color="transparent", hover_color=CLR["ghost"], text_color=CLR["sub"],
-                          command=self._clear_log).grid(row=0, column=1, sticky="e")
+            self.lbl_range = ctk.CTkLabel(head, text=self._preview_range, font=self.f_small,
+                                          text_color=CLR["sub"])
+            self.lbl_range.grid(row=0, column=1, sticky="e")
 
-            self.txt = ctk.CTkTextbox(box, corner_radius=10, font=self.f_log, wrap="word",
+            holder = ctk.CTkFrame(card, fg_color=CLR["log_bg"], corner_radius=10)
+            holder.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+            holder.grid_columnconfigure(0, weight=1)
+            holder.grid_rowconfigure(0, weight=1)
+            self._pv_holder = holder
+            self._mount_preview_canvas()
+
+        # 预览表是「只读的一屏文字」，不需要 110 个 CTkLabel 当控件：
+        # 直接在 canvas 上画文字 + 隔行色块，渲染和重绘都快一个数量级
+        # （用 110 个 CTkLabel 时，切回工作台要重绘这一屏，单帧 180ms，界面会顿一下）
+        PV_COL_W = (86, 86, 80, 70, 52, 108, 108, 70, 108, 74)
+        PV_ROW_H = 25
+        PV_PAD = 10
+
+        def _mount_preview_canvas(self):
+            import tkinter as tk
+            for w in self._pv_holder.winfo_children():
+                w.destroy()
+            bg = self._pal("log_bg")
+            canvas = tk.Canvas(self._pv_holder, bg=bg, highlightthickness=0, bd=0)
+            canvas.grid(row=0, column=0, sticky="nsew")
+            vsb = ctk.CTkScrollbar(self._pv_holder, width=12, command=canvas.yview)
+            vsb.grid(row=0, column=1, sticky="ns")
+            hsb = ctk.CTkScrollbar(self._pv_holder, height=12, orientation="horizontal",
+                                   command=canvas.xview)
+            hsb.grid(row=1, column=0, sticky="ew")
+            canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+            canvas.bind("<MouseWheel>", self._pv_wheel)
+            self._pv_canvas = canvas
+            self._render_preview(self._preview_rows, self._preview_range)
+
+        def _pv_font(self, bold=False):
+            import tkinter.font as tkfont
+            fonts = getattr(self, "_pv_fonts", None)
+            if fonts is None:
+                fonts = self._pv_fonts = {}
+            key = "bold" if bold else "normal"
+            if key not in fonts:
+                fonts[key] = tkfont.Font(family=FONT_UI, size=9,
+                                         weight="bold" if bold else "normal")
+            return fonts[key]
+
+        @staticmethod
+        def _pv_ellipsis(text, max_px, font):
+            """超出列宽就截断加省略号（canvas 文字没有控件那样的裁剪）"""
+            if max_px <= 0 or not text:
+                return ""
+            if font.measure(text) <= max_px:
+                return text
+            lo, hi = 0, len(text)
+            while lo < hi:
+                mid = (lo + hi + 1) // 2
+                if font.measure(text[:mid] + "…") <= max_px:
+                    lo = mid
+                else:
+                    hi = mid - 1
+            return (text[:lo] + "…") if lo else "…"
+
+        def _pv_col_x(self, ncol):
+            xs, x = [], self.PV_PAD
+            for c in range(ncol):
+                xs.append(x)
+                x += self.PV_COL_W[c] if c < len(self.PV_COL_W) else 96
+            return xs, x + self.PV_PAD
+
+        def _pv_wheel(self, event):
+            try:
+                if event.state & 0x1:
+                    self._pv_canvas.xview_scroll(-1 if event.delta > 0 else 1, "units")
+                else:
+                    self._pv_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+            except Exception:
+                pass
+
+        def _render_preview(self, rows, cell_range=None):
+            self._preview_rows = rows or []
+            if cell_range:
+                self._preview_range = cell_range
+            try:
+                self.lbl_range.configure(text=self._preview_range)
+            except Exception:
+                pass
+            cv = getattr(self, "_pv_canvas", None)
+            if cv is None:
+                return
+            cv.delete("all")
+            if not self._preview_rows:
+                cv.create_text(self.PV_PAD * 2, 26, anchor="nw",
+                               text="跑完一次核查后，这里显示被复制走的表格内容",
+                               fill=self._pal("sub"), font=self._pv_font())
+                cv.configure(scrollregion=(0, 0, 420, 90))
+                return
+
+            rows = self._preview_rows
+            ncol = max(len(r) for r in rows)
+            xs, total_w = self._pv_col_x(ncol)
+            total_h = len(rows) * self.PV_ROW_H + 8
+            for r in range(1, len(rows)):                 # 隔行底色（表头不着色）
+                if r % 2 == 0:
+                    cv.create_rectangle(0, r * self.PV_ROW_H, total_w,
+                                        (r + 1) * self.PV_ROW_H,
+                                        fill=self._pal("stripe"), width=0)
+            for r, row in enumerate(rows):
+                header = (r == 0)
+                font = self._pv_font(bold=header)
+                color = self._pal("sub") if header else self._pal("text")
+                y = r * self.PV_ROW_H + self.PV_ROW_H // 2
+                for c, val in enumerate(row):
+                    if not val:
+                        continue
+                    room = (self.PV_COL_W[c] if c < len(self.PV_COL_W) else 96) - 10
+                    cv.create_text(xs[c], y, anchor="w",
+                                   text=self._pv_ellipsis(str(val), room, font),
+                                   fill=color, font=font)
+            cv.configure(scrollregion=(0, 0, total_w, total_h))
+
+        def _build_log(self, page):
+            card = ctk.CTkFrame(page, fg_color=CLR["card"], corner_radius=14,
+                                border_width=1, border_color=CLR["line"])
+            card.grid(row=5, column=0, sticky="ew", padx=24, pady=(12, 18))
+            card.grid_columnconfigure(0, weight=1)
+            self.log_card = card
+            head = ctk.CTkFrame(card, fg_color="transparent")
+            head.grid(row=0, column=0, sticky="ew", padx=16, pady=(9, 4))
+            head.grid_columnconfigure(0, weight=1)
+            self.btn_log = ctk.CTkButton(head, text="运行日志  ▴", width=96, height=24, corner_radius=7,
+                                         font=self.f_sec, fg_color="transparent",
+                                         hover_color=CLR["ghost"], text_color=CLR["text"],
+                                         anchor="w", command=self._toggle_log)
+            self.btn_log.grid(row=0, column=0, sticky="w")
+            ctk.CTkButton(head, text="复制日志", width=76, height=24, corner_radius=7, font=self.f_small,
+                          fg_color="transparent", hover_color=CLR["ghost"], text_color=CLR["sub"],
+                          command=self._copy_log).grid(row=0, column=1, padx=(0, 6))
+            ctk.CTkButton(head, text="清空", width=52, height=24, corner_radius=7, font=self.f_small,
+                          fg_color="transparent", hover_color=CLR["ghost"], text_color=CLR["sub"],
+                          command=self._clear_log).grid(row=0, column=2)
+
+            self.txt = ctk.CTkTextbox(card, height=100, corner_radius=10, font=self.f_log, wrap="word",
                                       fg_color=CLR["log_bg"], border_width=1,
                                       border_color=CLR["line"], text_color=CLR["text"])
-            self.txt.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 16))
+            self.txt.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 12))
             self.txt.configure(state="disabled")
+            self._log_open = True
 
-        def _build_footer(self):
-            foot = ctk.CTkFrame(self, fg_color="transparent")
-            foot.grid(row=4, column=0, sticky="ew", padx=26, pady=(0, 16))
-            foot.grid_columnconfigure(1, weight=1)
-            self.lbl_foot = ctk.CTkLabel(foot, text="就绪，等待开始", font=self.f_body,
-                                         text_color=CLR["sub"])
-            self.lbl_foot.grid(row=0, column=0, sticky="w")
-            self.progress = ctk.CTkProgressBar(foot, width=200, height=6, corner_radius=3,
-                                               progress_color=RUN_CLR, fg_color=CLR["ghost"])
-            self.progress.set(0)
-            self.progress.grid(row=0, column=2, sticky="e")
-            ctk.CTkLabel(foot, text=f"v{current_app_version()}", font=self.f_sub,
-                         text_color=CLR["sub"]).grid(row=0, column=3, sticky="e", padx=(14, 0))
+        # ---------------- 历史记录 ----------------
+        def _build_history_page(self):
+            # 三个页面常驻显示、靠 lift 叠放，切换时不做 map/unmap：
+            # 每次重新映射这一百多个控件要花上百毫秒，切页会明显卡一下
+            page = ctk.CTkFrame(self.body, fg_color=CLR["win"])
+            page.grid_columnconfigure(0, weight=1)
+            page.grid_rowconfigure(1, weight=1)
 
-        # ---------------- 交互 ----------------
-        def _switch_theme(self, value):
-            ctk.set_appearance_mode("dark" if value == "深色" else "light")
+            head = ctk.CTkFrame(page, fg_color="transparent")
+            head.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 12))
+            head.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(head, text="历史记录", font=self.f_h1,
+                         text_color=CLR["text"]).grid(row=0, column=0, sticky="w")
+            ctk.CTkLabel(head, text="输出目录里的报表，可直接再次复制 C1:L11",
+                         font=self.f_sub, text_color=CLR["sub"]).grid(row=1, column=0, sticky="w", pady=(3, 0))
+            ctk.CTkButton(head, text="刷新", width=76, height=32, corner_radius=8, font=self.f_small,
+                          fg_color=CLR["ghost"], hover_color=CLR["ghost_h"], text_color=CLR["text"],
+                          command=self._refresh_history).grid(row=0, column=1, rowspan=2, sticky="e")
 
+            self.hist_box = ctk.CTkFrame(page, fg_color=CLR["card"], corner_radius=14,
+                                         border_width=1, border_color=CLR["line"])
+            self.hist_box.grid(row=1, column=0, sticky="nsew", padx=24, pady=(0, 18))
+            self.hist_box.grid_columnconfigure(0, weight=1)
+            self.hist_box.grid_rowconfigure(1, weight=1)
+
+            cols = ctk.CTkFrame(self.hist_box, fg_color="transparent")
+            cols.grid(row=0, column=0, sticky="ew", padx=18, pady=(12, 6))
+            for text, width in (("日期", 96), ("行数", 70), ("大小", 80), ("修改时间", 150)):
+                ctk.CTkLabel(cols, text=text, width=width, anchor="w", font=self.f_small,
+                             text_color=CLR["sub"]).pack(side="left")
+            ctk.CTkLabel(cols, text="操作", anchor="e", font=self.f_small,
+                         text_color=CLR["sub"]).pack(side="right")
+
+            self.hist_list = ctk.CTkScrollableFrame(self.hist_box, fg_color="transparent")
+            self.hist_list.grid(row=1, column=0, sticky="nsew", padx=10, pady=(0, 12))
+            return page
+
+        def _refresh_history(self):
+            for w in self.hist_list.winfo_children():
+                w.destroy()
+            items = scan_outputs(limit=self._cfg.get("history_limit", 80))
+            if not items:
+                ctk.CTkLabel(self.hist_list, text="还没有产物，去工作台跑一次核查吧",
+                             font=self.f_body, text_color=CLR["sub"]).pack(anchor="w", padx=16, pady=20)
+                return
+            self._hist_rows = {}
+            for it in items:
+                row = ctk.CTkFrame(self.hist_list, fg_color="transparent")
+                row.pack(fill="x", padx=6, pady=2)
+                ctk.CTkLabel(row, text=f"{it['day'][:4]}-{it['day'][4:6]}-{it['day'][6:]}",
+                             width=96, anchor="w", font=self.f_body,
+                             text_color=CLR["text"]).pack(side="left")
+                lbl_rows = ctk.CTkLabel(row, text="…" if it["rows"] is None else str(it["rows"]),
+                                        width=70, anchor="w", font=self.f_small,
+                                        text_color=CLR["sub"])
+                lbl_rows.pack(side="left")
+                self._hist_rows[it["path"]] = lbl_rows
+                ctk.CTkLabel(row, text=f"{it['size'] / 1024:.0f} KB", width=80, anchor="w",
+                             font=self.f_small, text_color=CLR["sub"]).pack(side="left")
+                ctk.CTkLabel(row, text=datetime.fromtimestamp(it["mtime"]).strftime("%m-%d %H:%M"),
+                             width=150, anchor="w", font=self.f_small,
+                             text_color=CLR["sub"]).pack(side="left")
+                ctk.CTkButton(row, text="再次复制", width=80, height=26, corner_radius=7,
+                              font=self.f_small, fg_color=CLR["ghost"], hover_color=CLR["ghost_h"],
+                              text_color=CLR["text"],
+                              command=lambda p=it["path"]: self._copy_for(p)).pack(side="right")
+                ctk.CTkButton(row, text="打开目录", width=80, height=26, corner_radius=7,
+                              font=self.f_small, fg_color="transparent", hover_color=CLR["ghost"],
+                              text_color=CLR["sub"],
+                              command=lambda p=os.path.dirname(it["path"]): self._open_path(p)).pack(
+                    side="right", padx=(0, 6))
+            threading.Thread(target=self._fill_row_counts,
+                             args=([i["path"] for i in items if i["rows"] is None],),
+                             daemon=True).start()
+
+        def _fill_row_counts(self, paths):
+            for path in paths:
+                n = count_sheet_rows(path)
+                if n is not None:
+                    self._q.put(("hist_rows", (path, n)))
+
+        # ---------------- 设置 ----------------
+        def _build_settings_page(self):
+            # 三个页面常驻显示、靠 lift 叠放，切换时不做 map/unmap：
+            # 每次重新映射这一百多个控件要花上百毫秒，切页会明显卡一下
+            page = ctk.CTkFrame(self.body, fg_color=CLR["win"])
+            page.grid_columnconfigure(0, weight=1)
+            page.grid_rowconfigure(1, weight=1)
+            head = ctk.CTkFrame(page, fg_color="transparent")
+            head.grid(row=0, column=0, sticky="ew", padx=24, pady=(20, 12))
+            ctk.CTkLabel(head, text="设置", font=self.f_h1, text_color=CLR["text"]).pack(side="left")
+            ctk.CTkLabel(head, text="改完点保存即时生效，无需重新发版", font=self.f_sub,
+                         text_color=CLR["sub"]).pack(side="left", padx=(12, 0), pady=(8, 0))
+
+            scroll = ctk.CTkScrollableFrame(page, fg_color="transparent")
+            scroll.grid(row=1, column=0, sticky="nsew", padx=22, pady=(0, 16))
+
+            self._set_vars = {}
+            body = self._section(scroll, "筛选条件", "只有同时满足以下条件的行才会进入报表")
+            cfg_filters = self._cfg.get("filters") or dict(FILTER_COLUMNS)
+            for col, val in cfg_filters.items():
+                row = self._setting_row(body, col)
+                ent = self._entry(row, width=180)
+                ent.insert(0, str(val))
+                self._set_vars[f"filter::{col}"] = ent
+
+            body = self._section(scroll, "排序", "按哪一列排序，分数列会按数值比较")
+            row = self._setting_row(body, "排序列")
+            ent = self._entry(row, width=180)
+            ent.insert(0, self._cfg.get("sort_keyword", SORT_COLUMN_KEYWORD))
+            self._set_vars["sort_keyword"] = ent
+            self.seg_sort = ctk.CTkSegmentedButton(row, values=["降序", "升序"], height=28,
+                                                   font=self.f_small, selected_color=CLR["accent"],
+                                                   selected_hover_color=CLR["accent_h"],
+                                                   unselected_color=CLR["ghost"],
+                                                   unselected_hover_color=CLR["ghost_h"],
+                                                   text_color=CLR["text"])
+            self.seg_sort.set("降序" if self._cfg.get("sort_desc", True) else "升序")
+            self.seg_sort.pack(side="left", padx=(10, 0))
+
+            body = self._section(scroll, "去重", "同一角色只保留排序后的第一行")
+            row = self._setting_row(body, "去重列")
+            ent = self._entry(row, width=180)
+            ent.insert(0, self._cfg.get("dedup_keyword", DEDUP_COLUMN_KEYWORD))
+            self._set_vars["dedup_keyword"] = ent
+
+            body = self._section(scroll, "剪贴板", "报表生成后自动复制的区域（Excel 记法）")
+            row = self._setting_row(body, "复制区域")
+            ent = self._entry(row, width=140)
+            ent.insert(0, self._cfg.get("clipboard_range") or CLIPBOARD_RANGE)
+            self._set_vars["clipboard_range"] = ent
+            self.var_clip = ctk.BooleanVar(value=bool(self._cfg.get("clipboard_enabled", True)))
+            ctk.CTkSwitch(row, text="输出后自动复制", variable=self.var_clip, font=self.f_small,
+                          text_color=CLR["text"], progress_color=CLR["accent"],
+                          button_color=CLR["card"]).pack(side="left", padx=(14, 0))
+
+            body = self._section(scroll, "完成后", "默认不弹窗，跑完即可直接粘贴")
+            self.var_popup = ctk.BooleanVar(value=bool(self._cfg.get("popup_on_done", False)))
+            ctk.CTkSwitch(body, text="弹出结果窗口（会打断当前操作）", variable=self.var_popup,
+                          font=self.f_small, text_color=CLR["text"],
+                          progress_color=CLR["accent"], button_color=CLR["card"]).pack(anchor="w")
+
+            body = self._section(scroll, "界面", "进度条平滑推进、统计数字滚动、运行中状态呼吸")
+            self.var_anim = ctk.BooleanVar(value=bool(self._cfg.get("animations", True)))
+            ctk.CTkSwitch(body, text="开启动效（关掉则所有状态切换都是瞬时）",
+                          variable=self.var_anim, font=self.f_small, text_color=CLR["text"],
+                          progress_color=CLR["accent"],
+                          button_color=CLR["card"]).pack(anchor="w")
+            ctk.CTkLabel(body, text="低配机器 / 远程桌面觉得卡的时候，把它关掉即可（切页本身从不做动画）",
+                         font=self.f_small, text_color=CLR["sub"]).pack(anchor="w", pady=(8, 0))
+
+            bar = ctk.CTkFrame(page, fg_color="transparent")
+            bar.grid(row=2, column=0, sticky="ew", padx=24, pady=(0, 16))
+            ctk.CTkButton(bar, text="保存设置", width=120, height=38, corner_radius=9, font=self.f_btn,
+                          fg_color=CLR["accent"], hover_color=CLR["accent_h"], text_color="#FFFFFF",
+                          command=self._save_settings_form).pack(side="left")
+            ctk.CTkButton(bar, text="恢复默认", width=96, height=38, corner_radius=9, font=self.f_small,
+                          fg_color=CLR["ghost"], hover_color=CLR["ghost_h"], text_color=CLR["text"],
+                          command=self._reset_settings_form).pack(side="left", padx=(10, 0))
+            self.lbl_settings_msg = ctk.CTkLabel(bar, text="", font=self.f_small, text_color=CLR["sub"])
+            self.lbl_settings_msg.pack(side="left", padx=(14, 0))
+            return page
+
+        def _section(self, parent, title, desc=""):
+            card = ctk.CTkFrame(parent, fg_color=CLR["card"], corner_radius=12,
+                                border_width=1, border_color=CLR["line"])
+            card.pack(fill="x", padx=2, pady=(0, 12))
+            ctk.CTkLabel(card, text=title, font=self.f_sec,
+                         text_color=CLR["text"]).pack(anchor="w", padx=16, pady=(12, 0))
+            if desc:
+                ctk.CTkLabel(card, text=desc, font=self.f_small,
+                             text_color=CLR["sub"]).pack(anchor="w", padx=16, pady=(2, 0))
+            body = ctk.CTkFrame(card, fg_color="transparent")
+            body.pack(fill="x", padx=16, pady=(8, 12))
+            return body
+
+        def _setting_row(self, body, label):
+            row = ctk.CTkFrame(body, fg_color="transparent")
+            row.pack(fill="x", pady=5)
+            ctk.CTkLabel(row, text=label, width=96, anchor="w", font=self.f_body,
+                         text_color=CLR["text"]).pack(side="left")
+            return row
+
+        def _entry(self, parent, width=180):
+            ent = ctk.CTkEntry(parent, width=width, height=32, font=self.f_body, corner_radius=8,
+                               fg_color=CLR["log_bg"], border_color=CLR["line"],
+                               text_color=CLR["text"])
+            ent.pack(side="left")
+            return ent
+
+        def _load_settings_into_form(self):
+            self._cfg = load_settings(force=True)
+            filters = self._cfg.get("filters") or {}
+            for key, widget in self._set_vars.items():
+                if key.startswith("filter::"):
+                    col = key.split("::", 1)[1]
+                    widget.delete(0, "end")
+                    widget.insert(0, str(filters.get(col, "")))
+                elif key == "sort_keyword":
+                    widget.delete(0, "end")
+                    widget.insert(0, self._cfg.get("sort_keyword", SORT_COLUMN_KEYWORD))
+                elif key == "dedup_keyword":
+                    widget.delete(0, "end")
+                    widget.insert(0, self._cfg.get("dedup_keyword", DEDUP_COLUMN_KEYWORD))
+                elif key == "clipboard_range":
+                    widget.delete(0, "end")
+                    widget.insert(0, self._cfg.get("clipboard_range") or CLIPBOARD_RANGE)
+            try:
+                self.var_clip.set(bool(self._cfg.get("clipboard_enabled", True)))
+                self.var_popup.set(bool(self._cfg.get("popup_on_done", False)))
+                self.var_anim.set(bool(self._cfg.get("animations", True)))
+                self.seg_sort.set("降序" if self._cfg.get("sort_desc", True) else "升序")
+            except Exception:
+                pass
+
+        def _collect_settings(self):
+            filters = {}
+            for key, widget in self._set_vars.items():
+                if key.startswith("filter::"):
+                    col = key.split("::", 1)[1]
+                    val = widget.get().strip()
+                    if val:
+                        filters[col] = val
+            return {
+                "filters": filters or dict(FILTER_COLUMNS),
+                "sort_keyword": self._set_vars["sort_keyword"].get().strip() or SORT_COLUMN_KEYWORD,
+                "sort_desc": self.seg_sort.get() != "升序",
+                "dedup_keyword": self._set_vars["dedup_keyword"].get().strip() or DEDUP_COLUMN_KEYWORD,
+                "clipboard_range": self._set_vars["clipboard_range"].get().strip() or CLIPBOARD_RANGE,
+                "clipboard_enabled": bool(self.var_clip.get()),
+                "popup_on_done": bool(self.var_popup.get()),
+                "animations": bool(self.var_anim.get()),
+            }
+
+        def _save_settings_form(self):
+            data = self._collect_settings()
+            self._cfg = save_settings(data)
+            self._preview_range = self._cfg.get("clipboard_range") or CLIPBOARD_RANGE
+            self.lbl_range.configure(text=self._preview_range)
+            if not self._anim_on():        # 关掉动效就把正在跑的补间停掉
+                self._stop_anims()
+                self.lbl_status.configure(fg_color=CLR["ghost"])
+            self.lbl_settings_msg.configure(text="已保存", text_color=OK_CLR)
+            self.after(1800, lambda: self.lbl_settings_msg.configure(text=""))
+
+        def _reset_settings_form(self):
+            self._cfg = save_settings(json.loads(json.dumps(DEFAULT_SETTINGS)))
+            self._load_settings_into_form()
+            self._preview_range = self._cfg.get("clipboard_range") or CLIPBOARD_RANGE
+            self.lbl_range.configure(text=self._preview_range)
+            self.lbl_settings_msg.configure(text="已恢复默认", text_color=WARN_CLR)
+            self.after(1800, lambda: self.lbl_settings_msg.configure(text=""))
+
+        # ---------------- 交互：日期 / 主题 ----------------
         def _set_quick_day(self, offset):
             day = (date.today() - timedelta(days=offset)).strftime("%Y%m%d")
             self.entry_day.delete(0, "end")
             self.entry_day.insert(0, day)
 
+        def _open_calendar(self):
+            day = re.sub(r"[^0-9]", "", self.entry_day.get()) or self._day_default
+            try:
+                DatePickerPopup(self, self.entry_day, day, on_pick=self._on_day_picked)
+            except Exception as e:
+                log(f"[警告] 日历打开失败: {e}")
+
+        def _on_day_picked(self, day):
+            self.entry_day.delete(0, "end")
+            self.entry_day.insert(0, day)
+
+        def _on_theme_change(self, value):
+            mode = "dark" if value == "深色" else "light"
+            ctk.set_appearance_mode(mode)
+            self._cfg = save_settings({"theme": mode})
+
+            def _repaint():
+                # 预览区是 tk.Canvas 自绘的，背景色写死在创建时，换主题必须重建一次
+                self._mount_preview_canvas()
+
+            self.after(60, _repaint)
+
+        # ---------------- 日志 ----------------
+        def _toggle_log(self):
+            self._log_open = not getattr(self, "_log_open", True)
+            if self._log_open:
+                self.txt.grid()
+                self.btn_log.configure(text="运行日志  ▴")
+            else:
+                self.txt.grid_remove()
+                self.btn_log.configure(text="运行日志  ▾")
+
         def _clear_log(self):
             self.txt.configure(state="normal")
             self.txt.delete("1.0", "end")
             self.txt.configure(state="disabled")
+
+        def _copy_log(self):
+            text = self.txt.get("1.0", "end").strip()
+            if not text:
+                return
+            try:
+                set_clipboard([[line] for line in text.splitlines()])
+                self._flash_status("日志已复制", OK_CLR)
+            except Exception as e:
+                log(f"[警告] 复制日志失败: {e}")
 
         def _append_log(self, text):
             self.txt.configure(state="normal")
@@ -2747,6 +3858,155 @@ if ctk is not None:
             self.txt.see("end")
             self.txt.configure(state="disabled")
 
+        # ---------------- 动效（补间引擎，设置里可整体关闭） ----------------
+        # 只用 tkinter 的 after 做数值补间，不做贴图/透明，避免这套 GUI 出现掉帧：
+        #   · 进度条按真实抓取比例平滑推进（而不是干等一个来回滚的条纹）
+        #   · 统计数字滚动到目标值
+        #   · 运行中状态胶囊轻轻呼吸
+        # 所有补间都按 key 登记，重入时先取消旧的；窗口关闭 / 任务收尾统一停掉。
+        ANIM_TICK_MS = 16          # ≈60fps，tkinter 在这个节奏下最稳
+        ANIM_STAT_MS = 480         # 统计数字滚动时长
+        ANIM_BAR_MS = 260          # 进度条推进时长
+        ANIM_BAR_TICK_MS = 24      # 进度条≈40fps：4px 细条看不出差别，省掉 1/3 次重绘
+        ANIM_PULSE_MS = 620        # 状态胶囊呼吸节奏
+
+        def _anim_on(self):
+            return bool(self._cfg.get("animations", True))
+
+        @staticmethod
+        def _ease_out(t):
+            """ease-out cubic：开头快、收尾轻，数字滚动手感比线性自然"""
+            return 1 - (1 - t) ** 3
+
+        def _cancel_tween(self, key):
+            aid = self._tweens.pop(key, None)
+            if aid:
+                try:
+                    self.after_cancel(aid)
+                except Exception:
+                    pass
+
+        def _tween(self, key, start, end, duration, step, done=None, tick=None):
+            """把 start→end 在 duration 毫秒内按 ease-out 喂给 step"""
+            self._cancel_tween(key)
+            if not self._anim_on() or duration <= 0 or abs(end - start) < 1e-9:
+                try:
+                    step(end)
+                except Exception:
+                    pass
+                if done:
+                    done()
+                return
+            tick = tick or self.ANIM_TICK_MS
+            t0 = time.monotonic()
+
+            def frame():
+                t = min(1.0, (time.monotonic() - t0) * 1000.0 / duration)
+                try:
+                    step(start + (end - start) * self._ease_out(t))
+                except Exception:
+                    self._tweens.pop(key, None)
+                    return
+                if t < 1.0:
+                    self._tweens[key] = self.after(tick, frame)
+                else:
+                    self._tweens.pop(key, None)
+                    if done:
+                        done()
+
+            frame()
+
+        def _set_stat(self, key, value, animate=True):
+            """统计块数字：从当前显示值滚到目标值（千位以上带逗号）"""
+            lbl = self._stat[key]
+            try:
+                target = int(value)
+            except (TypeError, ValueError):
+                lbl.configure(text=str(value))
+                return
+            raw = re.sub(r"[^0-9]", "", str(lbl.cget("text")))
+            current = int(raw) if raw else 0
+            if not animate or not self._anim_on() or abs(target - current) < 2:
+                lbl.configure(text=f"{target:,}")
+                return
+            self._tween(f"stat:{key}", current, target, self.ANIM_STAT_MS,
+                        lambda v: lbl.configure(text=f"{int(round(v)):,}"))
+
+        # ---- 进度条 ----
+        def _progress_begin(self):
+            self._cancel_tween("progress")
+            self._progress_val = 0.0
+            try:
+                self.progress.stop()
+                self.progress.configure(mode="determinate")
+                self.progress.set(0)
+            except Exception:
+                pass
+
+        def _progress_set(self, value):
+            self._progress_val = value
+            try:
+                self.progress.set(value)
+            except Exception:
+                pass
+
+        def _progress_to(self, frac):
+            """推到 frac（0~1）；从不定态切回来时先停下条纹动画"""
+            frac = max(0.0, min(1.0, float(frac)))
+            try:
+                if self.progress.cget("mode") != "determinate":
+                    self.progress.stop()
+                    self.progress.configure(mode="determinate")
+            except Exception:
+                pass
+            start = getattr(self, "_progress_val", 0.0)
+            if frac < start:            # 回退（重跑）时直接落位，别让条往回爬
+                start = frac
+            self._tween("progress", start, frac, self.ANIM_BAR_MS, self._progress_set,
+                        tick=self.ANIM_BAR_TICK_MS)
+
+        def _progress_busy(self):
+            """没有总量可算的阶段（导出 / 处理 / 复制）→ 换成 indeterminate 来回滚"""
+            self._cancel_tween("progress")
+            try:
+                if self.progress.cget("mode") != "indeterminate":
+                    self.progress.configure(mode="determinate")
+                    self.progress.set(max(getattr(self, "_progress_val", 0.0), 0.06))
+                    self.progress.configure(mode="indeterminate")
+                    self.progress.start()
+            except Exception:
+                pass
+
+        # ---- 状态胶囊呼吸 ----
+        def _pill_pulse(self, on):
+            self._pill_busy = bool(on)
+            self._cancel_tween("pill_beat")
+            if not on or not self._anim_on():
+                try:
+                    self.lbl_status.configure(fg_color=CLR["ghost"])
+                except Exception:
+                    pass
+                return
+
+            def beat(i=0):
+                if not self._pill_busy:
+                    return
+                try:
+                    self.lbl_status.configure(
+                        fg_color=CLR["nav_on"] if i % 2 == 0 else CLR["ghost"])
+                except Exception:
+                    return
+                self._tweens["pill_beat"] = self.after(
+                    self.ANIM_PULSE_MS, lambda: beat(i + 1))
+
+            beat(0)
+
+        def _stop_anims(self):
+            self._pill_busy = False
+            for key in list(self._tweens):
+                self._cancel_tween(key)
+
+        # ---------------- 队列 ----------------
         def _drain(self):
             try:
                 while True:
@@ -2779,48 +4039,237 @@ if ctk is not None:
                             self._update_dialog._on_error(payload)
                     elif kind == "check_state":
                         self.btn_check.configure(state=payload[0], text=payload[1])
+                    elif kind == "progress":
+                        self._on_progress(*payload)
+                    elif kind == "hist_rows":
+                        lbl = self._hist_rows.get(payload[0])
+                        if lbl is not None:
+                            lbl.configure(text=str(payload[1]))
             except queue.Empty:
                 pass
             self.after(80, self._drain)
 
-        def _ask_login_threadsafe(self, tip="", error="", default_account=""):
-            """抓取线程请求登录：投递到主线程弹框并等待结果（Tk 只能在主线程操作）"""
-            req = {"tip": tip, "error": error, "account": default_account,
-                   "res": None, "event": threading.Event()}
-            self._q.put(("ask_login", req))
-            req["event"].wait()
-            return req["res"]
+        # ---------------- 运行 ----------------
+        def _get_day(self):
+            return re.sub(r"[^0-9]", "", self.entry_day.get())
 
-        def _show_login(self, req):
-            """在主线程弹出登录对话框（由 _drain 调度）"""
+        def _on_start(self):
+            if self._running:
+                return
+            day = self._get_day()
             try:
-                req["res"] = LoginDialog(
-                    self, tip=req.get("tip", ""), error=req.get("error", ""),
-                    default_account=req.get("account", ""),
-                ).wait()
+                datetime.strptime(day, "%Y%m%d")
+            except ValueError:
+                self.entry_day.configure(border_color=ERR_CLR)
+                self.after(1500, lambda: self.entry_day.configure(border_color=CLR["line"]))
+                self._append_log(f"{datetime.now():%H:%M:%S}  [提示] 日期格式不正确，应为 20261119")
+                self._set_status("日期有误", ERR_CLR)
+                return
+            if not self._license_ok:
+                self._pending_day = day
+                return
+
+            self._running = True
+            self._last_day = day
+            self.btn_start.configure(state="disabled", text="核查中…")
+            self._progress_begin()
+            self._pill_pulse(True)
+            self._set_status("运行中", RUN_CLR)
+            self._reset_stages()
+            self._append_log("")
+            threading.Thread(target=self._worker, args=(day,), daemon=True).start()
+
+        def _worker(self, day):
+            def progress(stage, done, total):
+                self._q.put(("progress", (stage, done, total)))
+            try:
+                res = run_pipeline(day, progress=progress)
+            except PipelineError as e:
+                self._q.put(("error", (e.stage, str(e))))
+                return
             except Exception as e:
-                log(f"[警告] 登录窗口打开失败: {e}")
-                req["res"] = None
-            finally:
-                req["event"].set()
+                report_exception(e, stage="unknown", day=str(day))
+                self._q.put(("error", ("unknown", str(e))))
+                return
+            self._q.put(("done", res))
 
-        def _open_output_folder(self):
+        def _on_progress(self, stage, done, total):
+            self._paint_stage(stage, done, total)
+            if stage == "fetch":
+                if total:
+                    # 有总量才能算真实百分比：进度条按 抓到的条数/总条数 平滑推进
+                    self.lbl_stage_note.configure(text=f"{done}/{total} 条")
+                    self._progress_to(done / float(total))
+                else:
+                    self.lbl_stage_note.configure(text=f"已抓取 {done} 条" if done else "")
+                    self._progress_busy()
+            else:
+                # 导出 / 处理 / 复制：没有可比的总量，换成来回滚的条纹
+                self.lbl_stage_note.configure(text="")
+                self._progress_busy()
+
+        def _reset_stages(self):
+            for key, lbl in self._stage_lbl.items():
+                lbl.configure(text=self.STAGE_TEXT[key], text_color=CLR["sub"])
+            self.lbl_stage_note.configure(text="")
+
+        def _paint_stage(self, current, done=0, total=0):
+            """阶段指示只改颜色：文字宽度不变，避免每来一批数据就把整行挤得左右跳"""
             try:
-                path = open_folder(os.path.join(script_dir(), "replay核查"))
-                self._append_log(f"{datetime.now():%H:%M:%S}  [提示] 已在资源管理器中打开输出目录: {path}")
+                idx_cur = self.STAGE_ORDER.index(current)
+            except ValueError:
+                idx_cur = -1
+            for i, key in enumerate(self.STAGE_ORDER):
+                lbl = self._stage_lbl[key]
+                text = self.STAGE_TEXT[key]
+                if i < idx_cur:
+                    lbl.configure(text=text, text_color=OK_CLR)
+                elif i == idx_cur:
+                    lbl.configure(text=text, text_color=CLR["accent"])
+                else:
+                    lbl.configure(text=text, text_color=CLR["sub"])
+
+        def _set_status(self, text, color):
+            # 序号自增：任何一次状态变更都会让之前挂着的「自动恢复就绪」失效，
+            # 否则「已复制」的 2 秒复位可能把后来的「运行中」「处理失败」冲掉。
+            self._status_seq = getattr(self, "_status_seq", 0) + 1
+            try:
+                self.lbl_status.configure(text=f"●  {text}", text_color=color)
+            except Exception:
+                pass
+            return self._status_seq
+
+        def _flash_status(self, text, color):
+            seq = self._set_status(text, color)
+
+            def _restore():
+                if getattr(self, "_status_seq", 0) == seq:
+                    self._set_status("就绪", CLR["sub"])
+
+            self.after(2200, _restore)
+
+        def _on_finished(self, res):
+            self._running = False
+            self.btn_start.configure(state="normal", text="开始核查")
+            self._reset_progress(True)
+            stat = res.get("stat") or {}
+            if res.get("status") == "ok":
+                self._set_stat("fetch", res.get("count", 0))
+                self._set_stat("filter", stat.get("rows_after_filter", 0))
+                self._set_stat("dedup", stat.get("rows_after_dedup", 0))
+                self._last_out = stat.get("out_path") or ""
+                clip = stat.get("clip") or {}
+                if clip.get("ok"):
+                    self.clip_lbl.configure(
+                        text=f"已复制 {clip.get('range')} 到剪贴板（{clip.get('rows')} 行 × {clip.get('cols')} 列）")
+                    self.clip_bar.grid()
+                    self._set_status("已完成", OK_CLR)
+                else:
+                    self.clip_bar.grid_remove()
+                    self._set_status("已完成", OK_CLR)
+                self._render_preview(self._read_preview(self._last_out),
+                                     (clip.get("range") if clip.get("ok") else self._preview_range))
+                self._refresh_recent()
+                self._append_log(f"{datetime.now():%H:%M:%S}  完成：{stat.get('rows_after_dedup', 0)} 行")
+            else:
+                self._set_stat("fetch", 0, animate=False)
+                self._stat["filter"].configure(text="—")
+                self._stat["dedup"].configure(text="—")
+                self.clip_bar.grid_remove()
+                self._set_status("无数据", WARN_CLR)
+                self._render_preview([], self._preview_range)
+            if self._cfg.get("popup_on_done", False):
+                try:
+                    ResultWindow(self, res)
+                except Exception as e:
+                    log(f"[警告] 结果窗口打开失败: {e}")
+
+        def _read_preview(self, path):
+            if not path or not os.path.isfile(path):
+                return []
+            try:
+                return read_xlsx_range(path, self._preview_range)
             except Exception as e:
-                self._append_log(f"{datetime.now():%H:%M:%S}  [警告] 打开目录失败: {e}")
+                log(f"[警告] 预览读取失败: {e}")
+                return []
 
-        def _preheat(self):
-            """后台预热 pandas，降低首次点击后的等待"""
+        def _on_failed(self, stage, msg):
+            self._running = False
+            self.btn_start.configure(state="normal", text="开始核查")
+            self._reset_progress(False)
+            stage_text = {"fetch": "抓取失败", "csv": "导出失败", "process": "处理失败"}.get(stage, "运行失败")
+            self._set_status(stage_text, ERR_CLR)
+            self._paint_stage("", 0, 0)
             try:
-                import pandas  # noqa: F401
+                import tkinter.messagebox as mb
+                mb.showerror("运行失败", f"{stage_text}\n\n{msg}")
             except Exception:
                 pass
 
-        # ---------------- 授权验证（后台静默，界面不展示）----------------
+        def _reset_progress(self, done=True):
+            """收尾：停掉呼吸/条纹；成功时把条平滑推到满格，失败时停在当前进度不动"""
+            self._pill_pulse(False)
+            if done:
+                self._progress_to(1.0)
+            else:
+                self._cancel_tween("progress")
+                try:
+                    self.progress.stop()
+                except Exception:
+                    pass
+
+        # ---------------- 复制 / 目录 ----------------
+        def _copy_again(self):
+            if not self._last_out:
+                return
+            clip = copy_xlsx_range_to_clipboard(self._last_out)
+            if clip["ok"]:
+                self.clip_lbl.configure(
+                    text=f"已复制 {clip['range']} 到剪贴板（{clip['rows']} 行 × {clip['cols']} 列）")
+                self._flash_status("已复制", OK_CLR)
+            else:
+                self._flash_status("复制失败", ERR_CLR)
+                log(f"[警告] 复制失败：{clip['error']}")
+
+        def _copy_for(self, path):
+            clip = copy_xlsx_range_to_clipboard(path)
+            if clip["ok"]:
+                self._flash_status("已复制", OK_CLR)
+                log(f"[剪贴板] 已复制 {os.path.basename(path)} 的 {clip['range']}")
+            else:
+                self._flash_status("复制失败", ERR_CLR)
+                log(f"[警告] 复制失败：{clip['error']}")
+
+        def _open_output_folder(self):
+            self._open_path(output_folder())
+
+        def _open_path(self, path):
+            try:
+                open_folder(path)
+            except Exception as e:
+                log(f"[警告] 打开目录失败: {e}")
+
+        # ---------------- 最近任务 ----------------
+        def _refresh_recent(self):
+            for w in self.recent_box.winfo_children():
+                w.destroy()
+            items = scan_outputs(limit=3)
+            if not items:
+                ctk.CTkLabel(self.recent_box, text="暂无产物", font=self.f_small,
+                             text_color=CLR["sub"]).pack(anchor="w", padx=6)
+                return
+            for it in items:
+                row = ctk.CTkFrame(self.recent_box, fg_color="transparent", height=24)
+                row.pack(fill="x")
+                ctk.CTkLabel(row, text="●", font=self.f_small, text_color=OK_CLR,
+                             width=12).pack(side="left", padx=(6, 0))
+                text = f"{it['day'][4:6]}-{it['day'][6:]}  " + (
+                    f"{it['rows'] - 1} 行" if it["rows"] else "已产出")
+                ctk.CTkLabel(row, text=text, font=self.f_small,
+                             text_color=CLR["text"]).pack(side="left")
+
+        # ---------------- 授权（后台静默，界面不展示） ----------------
         def _reveal_for_license(self):
-            """授权校验通过（或授权被关闭）后才把窗口显示出来。"""
             if getattr(self, "_ui_hidden", False):
                 self._ui_hidden = False
                 try:
@@ -2830,13 +4279,6 @@ if ctk is not None:
                     pass
 
         def _start_license_check(self):
-            """后台静默校验授权。
-
-            界面上不出现任何授权相关文字，也不改动按钮 / 状态栏：
-              - 校验中：窗口尚未显示（见 __init__），用户看不到任何东西
-              - 校验通过：显示窗口，静默放行
-              - 校验失败：程序直接退出（仅在没有输出通道时于控制台留痕）
-            """
             if not LICENSE_ENABLED:
                 self._license_ok = True
                 self._license_pending = False
@@ -2844,17 +4286,11 @@ if ctk is not None:
                 self._reveal_for_license()
                 self._schedule_update_check()
                 return
-
             self._license_ok = False
             self._license_pending = True
             threading.Thread(target=self._license_worker, daemon=True).start()
 
         def _license_worker(self):
-            """工作线程：联网校验（首次会自动占用一个设备位）
-
-            必须传 on_denied：这样 SDK 只负责把错误码交回来，
-            由本程序决定怎么退出，不会自己去弹系统对话框。
-            """
             denied = {}
             try:
                 ok, payload, guard = verify_license(
@@ -2862,7 +4298,6 @@ if ctk is not None:
             except Exception as e:
                 ok, payload, guard = False, ("UNKNOWN", f"授权校验异常: {e}"), None
             if not ok and denied:
-                # 以 on_denied 截获到的错误码为准（比异常里带的更准确）
                 c, m = denied.get("code"), denied.get("message")
                 payload = (c, license_hint(c, m))
             self._license_guard = guard
@@ -2873,7 +4308,6 @@ if ctk is not None:
             self._license_pending = False
             self._license_info = info
             self._reveal_for_license()
-
             who = (info.customer if info else None) or "未署名"
             if info is not None and info.hard_expires_at:
                 tail = f"剩余 {info.days_left()} 天"
@@ -2882,13 +4316,8 @@ if ctk is not None:
             if info is not None and info.offline:
                 tail += "（本次为离线判定）"
             _license_trace(f"校验通过：{who} · {tail}")
-
             self._start_license_watchdog()
-
-            # 授权通过后才检测更新（避免未通过时界面上冒出更新弹窗）
             self._schedule_update_check()
-
-            # 用户在校验完成前就点了「开始」→ 现在静默补跑
             if self._pending_day:
                 self._pending_day = None
                 self.after(10, self._on_start)
@@ -2898,26 +4327,15 @@ if ctk is not None:
             self._license_ok = False
             self._license_pending = False
             self._pending_day = None
-            # 🚫 铁律：任何情况下都不弹授权提示。
-            # 即便后台把「到期时的行为」设成「弹提示后退出」，本程序也一律静默退出，
-            # 失败只体现为退出码（否则用户一眼就能看出软件带授权）。
             _, exit_code = license_fail_behavior(self._license_guard)
-            _license_trace(f"校验未通过: [{code}] {msg}"
-                           f"（静默退出，退出码 {exit_code}）")
-            # 未通过校验就不进入主界面
+            _license_trace(f"校验未通过: [{code}] {msg}（静默退出，退出码 {exit_code}）")
             self.after(200, lambda: _exit_now(exit_code))
 
         def _start_license_watchdog(self):
-            """后台看守：运行期间授权失效（到期 / 被吊销 / 被解绑）时按后端设定退出
-
-            复用启动时已通过校验的那个 guard，不再重新构造（避免二次激活占设备位）。
-            刻意不改 fail_mode / exit_code：它们已被后端策略刷新，后端是唯一权威。
-            """
             guard = self._license_guard
             if guard is None:
                 return
             try:
-                # 只接管「失败之后怎么退出」，不覆盖后端下发的退出行为
                 guard.cfg.on_denied = lambda c, m: self._q.put(
                     ("license_fail", (c, license_hint(c, m))))
                 guard.start_watchdog()
@@ -2926,28 +4344,14 @@ if ctk is not None:
 
         # ---------------- 在线更新 ----------------
         def _schedule_update_check(self):
-            """安排启动后的自动更新检查。
-
-            刻意不放在 __init__ 里：更新弹窗是个独立顶层窗口，不受主窗口 withdraw()
-            影响，若在授权校验出结果前弹出，就会在「本应无任何界面」的启动期露脸。
-            因此统一在**授权通过**（或授权被关闭）之后才发起。
-
-            开发构建（版本号仍是 0.0.0，即源码运行或本地自测包）直接跳过：
-            否则它永远比线上版本"旧"，每次启动都弹更新框，纯噪音。
-            手动点「检查更新」不受此限制（见 _check_update(manual=True)）。
-            """
             if not UPDATE_AUTO_CHECK or os.environ.get("AIREPLAY_NO_UPDATE"):
                 return
             if is_dev_build():
-                # 本地自测包（如 AIReplay-local.exe）版本号未注入，算 0.0.0，
-                # 若放行会永远提示「发现新版本」。启动期直接跳过；
-                # 用户手动点「检查更新」不受影响。
                 _license_trace("开发构建（版本号未注入），跳过自动更新检查")
                 return
             self.after(1200, lambda: self._check_update(manual=False))
 
         def _check_update(self, manual=False):
-            """检测新版本；manual=True 表示手动点击（会输出检测过程与结果）"""
             try:
                 self.btn_check.configure(state="disabled", text="检测中…")
             except Exception:
@@ -2959,7 +4363,7 @@ if ctk is not None:
         def _update_worker(self, manual):
             try:
                 status, payload = check_for_update()
-            except Exception as e:      # check_for_update 内部已兜底，这里再防一手
+            except Exception as e:
                 status, payload = "error", f"{type(e).__name__}: {e}"
             ts = f"{datetime.now():%H:%M:%S}"
             if status == "update":
@@ -2974,7 +4378,7 @@ if ctk is not None:
         def _show_update_dialog(self, info):
             self._append_log(
                 f"{datetime.now():%H:%M:%S}  [更新] 发现新版本 v{info['version']}"
-                f"（当前 v{current_app_version()}），可点击「立即更新」自动升级")
+                f"（当前 v{current_app_version()}），可一键升级")
             try:
                 if self._update_dialog is not None:
                     try:
@@ -2986,90 +4390,35 @@ if ctk is not None:
                 log(f"[警告] 更新窗口打开失败: {e}")
 
         def _quit_for_update(self):
-            """在线更新完成：退出当前进程，由新版本接管"""
             try:
                 self.destroy()
             except Exception:
                 pass
             _exit_now(0)
 
-        # ---------------- 运行 ----------------
-        def _on_start(self):
-            if self._running:
-                return
-            day = re.sub(r"[^0-9]", "", self.entry_day.get())
+        # ---------------- 登录 / 预热 / 关闭 ----------------
+        def _ask_login_threadsafe(self, tip="", error="", default_account=""):
+            req = {"tip": tip, "error": error, "account": default_account,
+                   "res": None, "event": threading.Event()}
+            self._q.put(("ask_login", req))
+            req["event"].wait()
+            return req["res"]
+
+        def _show_login(self, req):
             try:
-                datetime.strptime(day, "%Y%m%d")
-            except ValueError:
-                self.entry_day.configure(border_color=ERR_CLR)
-                self.after(1500, lambda: self.entry_day.configure(border_color=CLR["line"]))
-                self._append_log(f"{datetime.now():%H:%M:%S}  [提示] 日期格式不正确，请按 20260924 格式输入")
-                self._set_state("日期有误", ERR_CLR, "请检查抓取日期格式")
-                return
-
-            # 授权仍在后台校验中：静默记下请求，校验通过后自动继续（界面无任何提示）
-            if not self._license_ok:
-                self._pending_day = day
-                return
-
-            self._running = True
-            self.btn_start.configure(state="disabled", text="处理中…")
-            self.progress.configure(mode="indeterminate")
-            self.progress.start()
-            self._set_state("运行中", RUN_CLR, "正在抓取并处理，请稍候")
-            self._append_log("")
-            threading.Thread(target=self._worker, args=(day,), daemon=True).start()
-
-        def _worker(self, day):
-            try:
-                res = run_pipeline(day)
-            except PipelineError as e:
-                self._q.put(("error", (e.stage, str(e))))
-                return
+                req["res"] = LoginDialog(
+                    self, tip=req.get("tip", ""), error=req.get("error", ""),
+                    default_account=req.get("account", ""),
+                ).wait()
             except Exception as e:
-                report_exception(e, stage="unknown", day=str(day))
-                self._q.put(("error", ("unknown", str(e))))
-                return
-            self._q.put(("done", res))
+                log(f"[警告] 登录窗口打开失败: {e}")
+                req["res"] = None
+            finally:
+                req["event"].set()
 
-        def _set_state(self, text, color, footer=None):
-            self.lbl_status.configure(text=f"●  {text}", text_color=color)
-            if footer:
-                self.lbl_foot.configure(text=footer)
-
-        def _reset_progress(self, done=True):
+        def _preheat(self):
             try:
-                self.progress.stop()
-            except Exception:
-                pass
-            self.progress.configure(mode="determinate")
-            self.progress.set(1 if done else 0)
-
-        def _on_finished(self, res):
-            self._running = False
-            self.btn_start.configure(state="normal", text="开始抓取并处理")
-            if res.get("status") == "ok":
-                self._reset_progress(True)
-                stat = res.get("stat", {})
-                self._set_state("已完成", OK_CLR,
-                                f"完成：{stat.get('rows_after_dedup', 0)} 行，输出 {os.path.basename(stat.get('out_path', ''))}")
-            else:
-                self._reset_progress(False)
-                self._set_state("无数据", WARN_CLR, "该日期没有已核查记录")
-            try:
-                ResultWindow(self, res)
-            except Exception as e:
-                log(f"[警告] 结果窗口打开失败: {e}")
-
-        def _on_failed(self, stage, msg):
-            self._running = False
-            self.btn_start.configure(state="normal", text="开始抓取并处理")
-            self._reset_progress(False)
-            stage_text = {"fetch": "抓取失败", "csv": "导出失败", "process": "处理失败"}.get(stage, "运行失败")
-            self._set_state(stage_text, ERR_CLR, f"{stage_text}，详见日志")
-            try:
-                import tkinter.messagebox as mb
-                mb.showerror("运行失败", f"{stage_text}\n\n{msg}")
+                import pandas  # noqa: F401
             except Exception:
                 pass
 
@@ -3081,6 +4430,11 @@ if ctk is not None:
                         return
                 except Exception:
                     pass
+            self._stop_anims()          # 先摘掉所有补间定时器，否则销毁后回调会报错
+            try:
+                self.progress.stop()    # 停掉进度条自己的循环动画
+            except Exception:
+                pass
             self.destroy()
 
     def launch_gui(selfcheck=False):
@@ -3212,12 +4566,18 @@ def main():
         popup("无数据", f"{res['start_at']} ~ {res['end_at']} 没有「已核查」记录。")
         return 0
     stat = res["stat"]
+    clip = stat.get("clip") or {}
+    clip_line = (f"剪贴板: 已复制 {clip.get('range')}"
+                 f"（{clip.get('rows')} 行 × {clip.get('cols')} 列）\n"
+                 if clip.get("ok") else
+                 f"剪贴板: 未复制{('（' + clip['error'] + '）') if clip.get('error') else ''}\n")
     popup(
         "文档处理完成",
         f"CSV 记录: {stat['rows_before']} 条\n"
         f"筛选: {stat['rows_before']} → {stat['rows_after_filter']} 行\n"
         f"去重: {stat['rows_before_dedup']} → {stat['rows_after_dedup']} 行（按「{DEDUP_COLUMN_KEYWORD}」）\n"
         f"排序: 按「分数」降序\n"
+        f"{clip_line}"
         f"─────────────────\n"
         f"输出文件:\n{stat['out_path']}",
     )

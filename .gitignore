@@ -27,6 +27,7 @@ replay核查/
 error.log
 *.log
 .aireplay_update.json
+.aireplay_config.json
 *.part
 
 # ---- 编辑器 / 系统 ----
