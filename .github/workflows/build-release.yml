@@ -5,8 +5,9 @@ name: Build EXE & Publish Release
 #
 #   git push                # 就这一步，CI 自己算号、打包、发 Release
 #
-# 版本号怎么算：取仓库里**最高的已有 tag**，patch 位 +1，然后由 CI 自动打 tag。
-#   例：历史最高 v1.0.2  →  本次自动发 v1.0.3，并自动 push 该 tag
+# 版本号怎么算：取仓库里**最高的已有 tag** 递增一位，然后由 CI 自动打 tag。
+#   规则：patch 只跑 0~9，到 9 就进 minor（版本号永远是三段短号）
+#     例：v1.0.8 → v1.0.9      v1.0.9 → v1.1.0      v1.1.9 → v1.2.0
 #   首次（无任何 tag）  →  从 v1.0.1 起步
 #
 # 为什么不再用 `github.run_number`：
@@ -73,7 +74,7 @@ jobs:
           # 锁死打包器版本：与本地验证过的版本一致，避免 PyInstaller 升级导致产物行为漂移
           pip install pyinstaller==6.22.3
 
-      - name: 计算版本号（取历史最高 tag，patch +1）
+      - name: 计算版本号（取历史最高 tag 递增；patch 满 9 进 minor）
         id: ver
         shell: pwsh
         run: |
@@ -112,13 +113,29 @@ jobs:
               Write-Host "首次发版（无历史 tag）：$tag"
           }
           else {
-              # ── 取历史最高的 tag，patch 位 +1（只在最后一段进 1），然后自动打 tag ──
-              $maxTag = $allTags | Sort-Object { ToKey $_ } -Descending | Select-Object -First 1
+              # ── 取历史最高的 tag 递增一位，然后自动打 tag ──
+              # 递增规则：patch 只跑 0~9，到 9 就进 minor
+              #   v1.0.8 → v1.0.9      v1.0.9 → v1.1.0
+              #   v1.1.9 → v1.2.0      v1.0.10(遗留) → v1.1.0
+              # 目的：版本号永远是三段短号，不会出现 1.0.10 这种两位 patch。
+              #
+              # ⚠️ 必须用 [version] 排序：ToKey 返回的是字符串，
+              #    字符串降序会把 v1.0.9 排在 v1.0.10 前面（'9' > '1'），
+              #    于是算出来的下一个号可能 <= 历史最高，甚至和已有 tag 撞号 —— 版本号就卡死了。
+              $maxTag = $allTags | Sort-Object { [version](ToKey $_) } -Descending | Select-Object -First 1
               $parts  = @(($maxTag -replace '^v','') -split '\.')
               # 补足到 3 段（如 v1.0 → 1.0.0）
               while ($parts.Count -lt 3) { $parts += '0' }
-              $parts[$parts.Count - 1] = ([int]$parts[$parts.Count - 1] + 1).ToString()
-              $ver = $parts -join '.'
+              $major = [int]$parts[0]
+              $minor = [int]$parts[1]
+              $patch = [int]$parts[2]
+              if ($patch -ge 9) {
+                  $minor += 1
+                  $patch  = 0
+              } else {
+                  $patch += 1
+              }
+              $ver = "$major.$minor.$patch"
               $tag = "v$ver"
               "action=create" >> $env:GITHUB_OUTPUT
               Write-Host "自动递增：$maxTag → $tag"
@@ -139,6 +156,9 @@ jobs:
           "ver=$ver"                               >> $env:GITHUB_OUTPUT
           "short_sha=$sha"                         >> $env:GITHUB_OUTPUT
           "build_time=$time"                       >> $env:GITHUB_OUTPUT
+
+          # 显式收尾：本步骤前面跑过 git 探测，别让残留的 $LASTEXITCODE 决定步骤成败
+          exit 0
 
       - name: 版本号递增保护（不许重号 / 倒序）
         shell: pwsh
@@ -177,7 +197,8 @@ jobs:
               exit 0
           }
 
-          $maxTag = ($cands | Sort-Object { ToKey $_ } -Descending | Select-Object -First 1)
+          # 同「计算版本号」步骤：必须按 [version] 排，字符串排会把 v1.0.9 判成比 v1.0.10 大
+          $maxTag = ($cands | Sort-Object { [version](ToKey $_) } -Descending | Select-Object -First 1)
           $maxKey = ToKey $maxTag
 
           Write-Host "本次: v$ver ($thisKey)   历史最高: $maxTag ($maxKey)"
@@ -185,24 +206,50 @@ jobs:
               throw "版本号未递增：本次 v$ver 不大于历史最高 $maxTag。请检查是否手工打了一个低版本 tag。"
           }
           Write-Host "递增校验通过。"
+          # 显式收尾：上面 gh / git 探测可能留下非 0 的 $LASTEXITCODE，
+          # GitHub 的 pwsh 包装器结尾会拿它当步骤退出码
+          exit 0
 
       - name: 自动打 tag（仅自动递增时）
         if: steps.ver.outputs.action == 'create'
         shell: pwsh
         run: |
           # 号一旦推出就占用，避免下次构建重复用同一个号。
-          # 幂等：若 tag 已存在（例如上次构建失败后重跑），直接复用，不报错。
+          # 幂等：tag 已存在（例如上次构建失败后重跑）直接复用，不报错、不重复推送。
+          #
+          # ⚠️ 不能用 `git tag $tag` 的退出码判断 tag 是否存在：
+          #    tag 已存在时 git 返回非 0，而 GitHub 的 pwsh 包装器结尾是
+          #    `if (Test-Path variable:\LASTEXITCODE) { exit $LASTEXITCODE }`；
+          #    后面只跟了一条 Write-Host（cmdlet 不会重置 $LASTEXITCODE），
+          #    于是整个步骤带着那个非 0 退出码收场 —— 就是 v1.0.10 那次
+          #    「已存在，跳过创建」之后仍然 exit code 1 的原因。
+          #    改用 `git tag --list`：命中与否都返回 0，不会污染 $LASTEXITCODE。
           $tag = "${{ steps.ver.outputs.tag }}"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag $tag 2>$null
-          if ($LASTEXITCODE -eq 0) {
+
+          if (git tag --list $tag) {
+              Write-Host "本地已有 tag $tag，复用。"
+          } else {
+              git tag $tag
+              if ($LASTEXITCODE -ne 0) { throw "创建 tag $tag 失败" }
+              Write-Host "已创建 tag $tag"
+          }
+
+          # 远端已有就跳过推送（重跑时不必再推一次）
+          # 注意：git ls-remote 不加 --exit-code 时「查不到」也返回 0，
+          #       所以这里直接看输出是否为空，不依赖 $LASTEXITCODE
+          $remote = @(git ls-remote --tags origin "refs/tags/$tag")
+          if ($remote.Count -gt 0) {
+              Write-Host "远端已有 tag $tag，跳过推送。"
+          } else {
               git push origin $tag
               if ($LASTEXITCODE -ne 0) { throw "推送 tag $tag 失败" }
-              Write-Host "已自动推送 tag: $tag"
-          } else {
-              Write-Host "tag $tag 已存在，跳过创建（复用）。"
+              Write-Host "已推送 tag: $tag"
           }
+
+          # 显式收尾：把上面探测用的非 0 退出码清掉，否则步骤仍会被判失败
+          exit 0
 
       - name: 注入版本号到脚本
         shell: pwsh
