@@ -1,11 +1,11 @@
 name: Build EXE & Publish Release
 
 # ── 触发条件 ───────────────────────────────────────────────────────
-# 发版方式（方案 B）：**push 到 main 就自动发版**，版本号由 CI 自动计算。
+# 发版方式：push 到 main 就自动发版，版本号由 CI 自动计算。
 #
 #   git push                # 就这一步，CI 自己算号、打包、发 Release
 #
-# 版本号怎么算：取仓库里**最高的已有 tag** 递增一位，然后由 CI 自动打 tag。
+# 版本号怎么算：取仓库里最高的已有 tag 递增一位，然后由 CI 自动打 tag。
 #   规则：patch 只跑 0~9，到 9 就进 minor（版本号永远是三段短号）
 #     例：v1.0.8 → v1.0.9      v1.0.9 → v1.1.0      v1.1.9 → v1.2.0
 #   首次（无任何 tag）  →  从 v1.0.1 起步
@@ -22,7 +22,7 @@ name: Build EXE & Publish Release
 # 注 2：workflow_dispatch 仅用于「重发某个 tag」或验证打包流程；
 #       留空 = 取最新已有 tag 原样重发，不会 +1。
 #
-# ⚠️ 必需的仓库 Secret（Settings → Secrets and variables → Actions）：
+# 必需的仓库 Secret（Settings → Secrets and variables → Actions）：
 #     APP_LICENSE_KEY = 授权码（形如 XXXX-XXXX-XXXX-XXXX）
 #   授权码不写进仓库，打包前由「注入授权码到脚本」步骤注入到 LICENSE_KEY；
 #   注入失败（Secret 缺失 / 格式不对 / 回读不一致）会直接让构建失败 ——
@@ -119,7 +119,7 @@ jobs:
               #   v1.1.9 → v1.2.0      v1.0.10(遗留) → v1.1.0
               # 目的：版本号永远是三段短号，不会出现 1.0.10 这种两位 patch。
               #
-              # ⚠️ 必须用 [version] 排序：ToKey 返回的是字符串，
+              # 必须用 [version] 排序：ToKey 返回的是字符串，
               #    字符串降序会把 v1.0.9 排在 v1.0.10 前面（'9' > '1'），
               #    于是算出来的下一个号可能 <= 历史最高，甚至和已有 tag 撞号 —— 版本号就卡死了。
               $maxTag = $allTags | Sort-Object { [version](ToKey $_) } -Descending | Select-Object -First 1
@@ -167,7 +167,7 @@ jobs:
         run: |
           # 目标：确保本次版本号 > 历史所有已发布版本号。
           # 版本号一旦倒序，老用户的 number 更大，程序会判定「无更新」，更新链就断了。
-          # ⚠️ 本步骤刻意排在「自动打 tag」之前：万一校验不过，远端不会被留下一个坏 tag。
+          # 本步骤刻意排在「自动打 tag」之前：万一校验不过，远端不会被留下一个坏 tag。
           $ver = "${{ steps.ver.outputs.ver }}"
 
           # 重发模式：同一个 tag 再发一次是允许的，不做递增校验
@@ -217,12 +217,12 @@ jobs:
           # 号一旦推出就占用，避免下次构建重复用同一个号。
           # 幂等：tag 已存在（例如上次构建失败后重跑）直接复用，不报错、不重复推送。
           #
-          # ⚠️ 不能用 `git tag $tag` 的退出码判断 tag 是否存在：
+          # 不能用 `git tag $tag` 的退出码判断 tag 是否存在：
           #    tag 已存在时 git 返回非 0，而 GitHub 的 pwsh 包装器结尾是
           #    `if (Test-Path variable:\LASTEXITCODE) { exit $LASTEXITCODE }`；
           #    后面只跟了一条 Write-Host（cmdlet 不会重置 $LASTEXITCODE），
-          #    于是整个步骤带着那个非 0 退出码收场 —— 就是 v1.0.10 那次
-          #    「已存在，跳过创建」之后仍然 exit code 1 的原因。
+          #    于是整个步骤带着那个非 0 退出码收场 ——
+          #    表现就是「已存在，跳过创建」之后整步仍然 exit code 1。
           #    改用 `git tag --list`：命中与否都返回 0，不会污染 $LASTEXITCODE。
           $tag = "${{ steps.ver.outputs.tag }}"
           git config user.name  "github-actions[bot]"
@@ -315,7 +315,14 @@ jobs:
       - name: 打包 exe
         shell: pwsh
         run: |
+          if (-not (Test-Path "assets/app.ico")) {
+              throw "缺少 assets/app.ico（exe 图标 / 窗口图标）。可运行 py tools/make_icon.py 重新生成。"
+          }
+          # --icon       → exe 在资源管理器 / 任务栏里的图标
+          # --add-data   → 让程序运行时也能拿到 .ico 设置窗口图标（onefile 会解到 sys._MEIPASS）
           pyinstaller --noconsole --onefile --clean --noupx `
+            --icon "assets/app.ico" `
+            --add-data "assets/app.ico;assets" `
             --collect-all customtkinter `
             --name "$env:APP_NAME" `
             "$env:ENTRY"
@@ -347,8 +354,8 @@ jobs:
           name: ${{ steps.ver.outputs.name }}
           target_commitish: ${{ github.sha }}
           files: release/*.exe
-          # ⚠️ 必须保持 false：开启后平台会自动往正文追加一条「Full Changelog」对比链接，
-          #    而正文会**原样显示在程序内的「更新说明」里**，等于把仓库地址暴露给用户。
+          # 必须保持 false：开启后平台会自动往正文追加一条「Full Changelog」对比链接，
+          #    而正文会原样显示在程序内的「更新说明」里，等于把仓库地址暴露给用户。
           generate_release_notes: false
           make_latest: true
           # 正文 = 程序内「更新说明」的原文，因此这里只写面向用户的内容：

@@ -36,5 +36,5 @@ error.log
 .DS_Store
 Thumbs.db
 
-# ---- 本助手工作区数据（本地记忆等）----
+# ---- 本地工作区缓存 ----
 .workbuddy/

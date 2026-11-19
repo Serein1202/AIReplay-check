@@ -4,22 +4,24 @@
 Replay 核查一体化脚本（图形界面版）
 =================================================================
 一次运行完成「后台抓取 → CSV 导出 → 筛选/排序/去重 → xlsx 输出」全流程，
-带可视化操作界面（customtkinter），替代原有的原生弹窗交互。
+带可视化操作界面（customtkinter）。
 
 界面用法:
-  1. 双击/运行脚本打开窗口，抓取日期默认「昨天」，可点「昨天/今天/前天」或手动输入
-  2. 点击「开始抓取并处理」，日志区实时滚动显示抓取与处理进度
-  3. 完成后弹出结果卡片，统计筛选、去重行数，可一键打开输出目录
+  1. 打开窗口后在「工作台」选日期（默认「昨天」，可点快捷日期或自绘月历），点「开始核查」
+  2. 四段阶段指示（抓取 → 导出 → 处理 → 复制）配细进度条，三块统计实时更新；日志可展开
+  3. 完成后就地出现「已复制 C1:L11」提示条，下方的预览表就是将被复制的内容
+  4. 左侧导航可切到「历史记录」（对已有产物再次复制 / 打开所在目录）与「设置」
+     （筛选、排序、去重、剪贴板区域、完成后是否弹窗、界面动效、深浅色主题）
 
 输出与剪贴板:
-  - xlsx 生成后**不会自动打开文件**（也不弹 Excel），只在结果卡片里展示路径
+  - xlsx 生成后不会自动打开文件（也不弹 Excel），只在结果卡片里展示路径
   - 生成后立即把 xlsx 的 CLIPBOARD_RANGE 区域（默认 C1:L11）复制到剪贴板，
     同时写「制表符文本 + HTML 表格」两种格式：
       粘到 Excel / WPS → 按单元格铺开；粘到微信 / 飞书 / Word → 直接变成表格
   - 区域数据不足（当天行数少于 11）时自动裁掉尾部空行 / 空列，不会粘出一串空制表符
   - 剪贴板被其他程序占用导致失败时只记一条警告，报表本身不受影响
   - 结果卡片提供「再次复制 C1:L11」，无需重跑抓取
-  - 关闭：把 CLIPBOARD_ENABLED 改为 False（或 CLIPBOARD_RANGE 设为 ""）
+  - 关闭：设置页关掉「输出后自动复制」（写进 .aireplay_config.json 的 clipboard_enabled）
 
 命令行用法:
   python AIReplay-check.py 20260924         # 静默模式（自动化 / 定时任务）
@@ -30,12 +32,12 @@ Replay 核查一体化脚本（图形界面版）
 
 软件授权（License Guard）:
   - 由自建授权服务签发令牌，客户端仅做验签，校验全程在后台进行
-  - **不露痕迹（硬性要求，用户明确要求）**：任何情况下都不能让人看出软件带授权 ——
+  - 全程静默：任何情况下都不能让人看出软件带授权 ——
       · 界面（日志区 / 状态栏 / 按钮）不显示任何授权信息
       · 任何情况下都不弹授权对话框（即使后台把「到期时的行为」设成「弹提示后退出」）
-      · **命令行也零输出**：没有 --license 之类的子命令，校验失败不打印任何字样
+      · 命令行同样零输出：没有 --license 之类的子命令，校验失败不打印任何字样
       · 诊断信息默认全部丢弃；排障时设 AIREPLAY_LICENSE_TRACE=<文件路径> 才写盘
-  - 授权码**不写进仓库**：仓库里 LICENSE_KEY 为空，正式构建时由 CI 从 GitHub Secrets
+  - 授权码不写进仓库：仓库里 LICENSE_KEY 为空，正式构建时由 CI 从 GitHub Secrets
     注入到脚本里再打包（这样公开仓库和 git 历史里都查不到授权码）
     （运行时的覆盖优先级：环境变量 LICENSE_KEY > 程序同目录 license.key > 脚本内置 LICENSE_KEY）
   - 其余策略完全跟随后台设置，客户端不自行揣测：
@@ -96,16 +98,18 @@ Replay 核查一体化脚本（图形界面版）
     以源码方式运行时显示占位版本，且不提供在线更新
 
 依赖:
-  pip install pandas openpyxl sentry-sdk customtkinter
+  pip install -r requirements.txt
 
 打包 exe:
-  pyinstaller --noconsole --onefile --collect-all customtkinter --name "AIReplay" AIReplay-check.py
+  pyinstaller --noconsole --onefile --clean --collect-all customtkinter \
+    --icon "assets/app.ico" --add-data "assets/app.ico;assets" \
+    --name "AIReplay" AIReplay-check.py
 
 自动构建与发布:
-  向 main 分支推送任何 .py 改动 → GitHub Actions 自动打包 exe 并发布到仓库 Releases，
+  推送到 main 分支 → GitHub Actions 自动打包 exe 并发布到仓库 Releases，
   发布文件命名为 AIReplay-<版本号>.exe（如 AIReplay-v1.0.1.exe）
-  配置见 .github/workflows/build-release.yml，版本号默认 v1.0.<构建号>；
-  也可以打标签指定版本: git tag v1.2.0 && git push origin v1.2.0
+  配置见 .github/workflows/build-release.yml；版本号取历史最高 tag 递增一位
+  （patch 只跑 0~9，到 9 进 minor），由 CI 自动打 tag
 """
 
 import base64
@@ -200,9 +204,9 @@ FONT_UI = "Microsoft YaHei UI"
 # 当前版本号：仓库源码里保留占位值，打包时由 GitHub Actions 注入该次发布的真实版本号
 # （见 .github/workflows/build-release.yml 的「注入版本号」步骤）
 #
-# ⚠️ 发布方式（方案 B）：**push 到 main 就自动发版**，版本号由 CI 自动算。
+# 发布方式：push 到 main 就自动发版，版本号由 CI 自动计算。
 #     git push            # 就这一步
-#   CI 取历史最高 tag，patch 位 +1（如 v1.0.2 → v1.0.3），自动打 tag 并发布 Release。
+#   CI 取历史最高 tag 递增一位（如 v1.0.9 → v1.1.0），自动打 tag 并发布 Release。
 #   号完全由历史 tag 推算，天然单调递增；CI 还会做一次倒序保护校验。
 #   何时需要手动打 tag：只在「想指定某个特定版本号」时才需要，平时不用管。
 APP_VERSION = "0.0.0"
@@ -263,7 +267,7 @@ LICENSE_TIMEOUT = 8                                       # 单次校验请求�
 # 若想更快生效，把它调小（例如 120），并同时把下面的上限也设成同样的值。
 LICENSE_WATCHDOG_SEC = 0
 # 复查间隔上限（秒）。0 = 不封顶，完全跟随后端心跳间隔（当前即 6 小时一次）。
-# ⚠️ SDK 只把 watchdog_interval_sec 当「第一次复查」的等待时间，之后的间隔会
+# 注意：SDK 只把 watchdog_interval_sec 当「第一次复查」的等待时间，之后的间隔会
 # 重新按后端心跳计算；所以想缩短复查间隔，这两项要一起改才有效。
 LICENSE_HEARTBEAT_CAP_SEC = 0
 # 缓存令牌「免联网直接放行」的宽限时长（秒）：
@@ -347,6 +351,22 @@ def script_dir():
     if getattr(sys, "frozen", False):
         return os.path.dirname(os.path.abspath(sys.executable))
     return os.path.dirname(os.path.abspath(__file__))
+
+
+def app_icon_path():
+    """窗口图标 assets/app.ico 的路径；找不到返回 None（没图标也能正常跑）。
+
+    打包成 onefile 后，--add-data 加进来的文件被解到 sys._MEIPASS 下，
+    所以要先看那里，再回落到脚本目录（源码直接运行时用）。
+    """
+    roots = [getattr(sys, "_MEIPASS", None), script_dir()]
+    for root in roots:
+        if not root:
+            continue
+        p = os.path.join(root, "assets", "app.ico")
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 def _console(msg):
@@ -1055,7 +1075,7 @@ def create_license_guard(on_denied=None):
             online_check_interval_sec=LICENSE_ONLINE_CHECK_SEC,  # 0 = 每次校验都联网
             fail_mode=LICENSE_FAIL_MODE,   # 兜底默认；成功后端策略会覆盖它
             exit_code=LICENSE_EXIT_CODE,   # 同上
-            allow_dialog=False,            # 🚫 铁律：SDK 不得自己弹任何授权对话框
+            allow_dialog=False,            # 铁律：SDK 不得自己弹任何授权对话框
             on_denied=on_denied,
         )
         return license_guard.LicenseGuard(cfg)
@@ -1066,8 +1086,8 @@ def create_license_guard(on_denied=None):
 def license_fail_behavior(guard=None):
     """返回校验失败时该怎么做：(是否弹提示, 退出码)
 
-    **本程序永不弹授权提示。** 用户要求「不管什么情况都不要出现授权码相关提示，
-    不希望别人知道软件设置了授权」，因此第一个返回值恒定是 False ——
+    本程序永不弹授权提示：不管什么情况，都不能出现授权码相关的提示，
+    也不能让人看出软件设置了授权。因此第一个返回值恒定是 False ——
     即便后台把「到期时的行为」设成「弹提示后退出」，界面上也不会出现任何对话框，
     该旋钮对界面彻底失效（后台那边仍可留着，不影响）。
 
@@ -1296,7 +1316,7 @@ class _DATA_BLOB(ctypes.Structure):
     _fields_ = [("cbData", wintypes.DWORD), ("pbData", wintypes.LPVOID)]
 
 
-# ⚠️ 必须显式声明 LocalFree 的 argtypes。不声明时 ctypes 会把 Python int 按
+# 必须显式声明 LocalFree 的 argtypes。不声明时 ctypes 会把 Python int 按
 # 32 位 C int 转换，而 64 位进程里 DPAPI 返回的堆指针通常超过 2^31，
 # LocalFree(指针) 会抛 OverflowError（int too long to convert）——
 # 曾导致「加密成功但函数以异常收场」，save_credentials 只 open 没 write，
@@ -2128,7 +2148,6 @@ def copy_xlsx_range_to_clipboard(xlsx_path, cell_range=None):
 def process_csv(path, out_folder, day):
     """CSV → 筛选/排序/去重 → xlsx，返回统计信息与输出路径"""
     import pandas as pd
-    from openpyxl.utils import get_column_letter
 
     cfg = load_settings()
     enc = detect_csv_encoding(path)
@@ -2320,7 +2339,7 @@ DEFAULT_SETTINGS = {
     "clipboard_range": CLIPBOARD_RANGE,
     "popup_on_done": False,                   # 完成后弹结果窗（默认关：不打断粘贴）
     "animations": True,                       # 界面动效（进度条平滑 / 数字滚动 / 状态呼吸）
-    "theme": "dark",
+    "theme": "light",
     "history_limit": 80,
 }
 
@@ -3093,6 +3112,15 @@ if ctk is not None:
         def __init__(self, selfcheck=False):
             global _LOG_SINK, _LOGIN_UI
             super().__init__()
+
+            # 窗口图标：iconbitmap(default=...) 一次设好，所有 Toplevel（结果窗 / 登录 / 更新）自动继承。
+            # 打包成 exe 后 .ico 在 sys._MEIPASS/assets 下，源码运行时在脚本目录下。
+            _ico = app_icon_path()
+            if _ico:
+                try:
+                    self.iconbitmap(default=_ico)
+                except Exception:
+                    pass
 
             # 授权校验出结果之前先把窗口藏起来（否则网络慢时界面会先露出来几十秒）
             self._ui_hidden = bool(LICENSE_ENABLED) and not selfcheck
@@ -4417,8 +4445,11 @@ if ctk is not None:
                 req["event"].set()
 
         def _preheat(self):
+            # 空闲时先把 pandas 拉进来（首次 import 要几百毫秒），
+            # 免得点「开始」那一刻才付这笔钱
             try:
-                import pandas  # noqa: F401
+                import importlib
+                importlib.import_module("pandas")
             except Exception:
                 pass
 
@@ -4439,7 +4470,8 @@ if ctk is not None:
 
     def launch_gui(selfcheck=False):
         """启动图形界面；selfcheck=True 时短暂启动后自动退出（用于打包自检）"""
-        ctk.set_appearance_mode("dark")
+        # 首帧之前就把外观定成用户上次选的（默认浅色），否则会先闪一下深色再切过来
+        ctk.set_appearance_mode("dark" if load_settings().get("theme") == "dark" else "light")
         ctk.set_default_color_theme("blue")
         app = ReplayApp(selfcheck=selfcheck)
         if selfcheck:
@@ -4497,7 +4529,7 @@ def main():
         return 0
 
     # 注意：以前这里有个 --license 子命令，会在控制台打印授权状态。
-    # 用户要求「任何情况下都不能让人看出软件带授权」，该子命令已删除。
+    # 现在不允许出现任何能看出软件带授权的字样，该子命令已删除。
     # 排障需要看授权结果时，设环境变量 AIREPLAY_LICENSE_TRACE=<文件路径>。
 
     # --check-update：只检测更新并打印结果，不启动界面

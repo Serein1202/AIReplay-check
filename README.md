@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/app.png" width="96" alt=""></p>
+
 # AIReplay-check
 
 Replay 核查一体化工具：一次运行完成「后台抓取 → CSV 导出 → 筛选 / 排序 / 去重 → xlsx 输出」，带图形操作界面。
@@ -13,10 +15,10 @@ Replay 核查一体化工具：一次运行完成「后台抓取 → CSV 导出 
 | 页面 | 作用 |
 | --- | --- |
 | **工作台** | 选日期（快捷「昨天 / 今天 / 前天」或点开自绘月历）→ 开始核查；四段阶段指示（抓取 → 导出 → 处理 → 复制）+ 细进度条；三块统计（抓取条数 / 筛选后 / 去重后）；成功后就地出现「已复制 C1:L11」提示条与「再次复制」；下方是复制内容预览表（可横竖滚动）与可收起的运行日志 |
-| **历史记录** | 扫输出目录里已有的 `replay核查-<日期>.xlsx`，显示行数 / 大小 / 修改时间，可对任意一份**再次复制**或打开所在目录（行数后台异步回填，不卡界面） |
+| **历史记录** | 扫输出目录里已有的 `replay核查-<日期>.xlsx`，显示行数 / 大小 / 修改时间，可对任意一份再次复制或打开所在目录（行数后台异步回填，不卡界面） |
 | **设置** | 筛选条件、排序列与升降序、去重列、剪贴板区域与开关、完成后是否弹结果窗、界面动效开关；改完点「保存设置」即时生效，「恢复默认」一键回到初始配置 |
 
-左侧底部固定有深/浅色主题切换、检查更新入口与当前版本号；窗口默认 1180×800，最小 1080×720。
+左侧底部固定有深/浅色主题切换、检查更新入口与当前版本号；**默认浅色**，切成深色后会记住。窗口默认 1180×800，最小 1080×720。
 
 ## 下载使用
 
@@ -26,14 +28,14 @@ Replay 核查一体化工具：一次运行完成「后台抓取 → CSV 导出 
 
 ## 软件授权
 
-程序内置授权校验（License Guard）。**核心原则：相关参数完全跟随后台设置**，
+程序内置授权校验（License Guard）。核心原则是相关参数完全跟随后台设置，
 客户端不自己揣测策略，后台改完即生效。
 
-- **授权码不打进仓库**：仓库里 `LICENSE_KEY` 是空的，正式构建时由 CI 从仓库 Secret
+- 授权码不打进仓库：仓库里 `LICENSE_KEY` 是空的，正式构建时由 CI 从仓库 Secret
   `APP_LICENSE_KEY` 注入后再打包 —— 这样公开仓库和 git 历史里都查不到授权码，
   换码也只需改 Secret 重跑构建，不必改代码。运行时的覆盖优先级：
   环境变量 `LICENSE_KEY` > 程序同目录的 `license.key` > 脚本内置值
-- **每次启动都会联网校验**（`LICENSE_ONLINE_CHECK_SEC = 0`），因此后台把授权码改成
+- 每次启动都会联网校验（`LICENSE_ONLINE_CHECK_SEC = 0`），因此后台把授权码改成
   过期 / 吊销 / 暂停，客户端下次启动立刻被拦下（此前版本会被本地缓存令牌「离线放行」挡掉）
 - 以下参数由后台下发，客户端原样执行：
 
@@ -48,17 +50,18 @@ Replay 核查一体化工具：一次运行完成「后台抓取 → CSV 导出 
 - 只有真的连不上授权服务器时，才按后台的「断网容忍天数」离线放行
 - 服务端明确判失效（过期 / 吊销 / 暂停 / 授权码不存在）时会同时清掉本地缓存令牌，
   避免「断网后靠旧令牌继续跑」
-- 界面**不显示任何授权信息**：失败原因只走 stdout，而 exe 是 `--noconsole` 构建，等同于不可见
-- 命令行检查状态：`AIReplay-check.py --license`（失败时返回非 0 退出码）
+- 界面不显示任何授权信息，也没有查看授权状态的命令：失败原因只走 stdout，而 exe 是
+  `--noconsole` 构建，等同于不可见。排障时设环境变量
+  `AIREPLAY_LICENSE_TRACE=<日志文件路径>` 才会把校验过程写盘
 
-> ⚠️ 后台表单里的「断网容忍天数」若设为 `0`，程序就**必须每次启动都能连上授权服务器**。
+> 注意：后台表单里的「断网容忍天数」若设为 `0`，程序就必须每次启动都能连上授权服务器。
 > 本机到授权服务的链路曾出现整段时间不可达（超时），此时程序会因 `NETWORK` 而无法启动。
 
 > `license.key` 若存在则含凭据，请勿提交到仓库（已在 `.gitignore` 中忽略）。
 
 ## 自动更新检测
 
-程序**打开时会自动检测 GitHub 最新 Release**：
+程序打开时会自动检测 GitHub 最新 Release：
 
 - 发现更高版本 → 弹窗显示新旧版本、安装包大小与更新说明，「立即更新」即自动下载并重启到新版本
 - 新版本下载为 `AIReplay-<版本号>.exe` 放在原程序同目录，重启后自动清理旧版本文件，目录里不会堆积历史 exe
@@ -91,7 +94,7 @@ Replay 核查一体化工具：一次运行完成「后台抓取 → CSV 导出 
 
 ## 自动构建与发布
 
-仓库已配置 GitHub Actions：**只要推送 `.py` 文件的改动，就会自动打包成 exe 并发布到 Releases**，无需本地装环境。
+仓库已配置 GitHub Actions：推送到 `main` 分支就会自动打包成 exe 并发布到 Releases，无需本地装环境。
 
 | 操作 | 结果 |
 | --- | --- |
@@ -100,7 +103,7 @@ Replay 核查一体化工具：一次运行完成「后台抓取 → CSV 导出 
 
 每次发布会生成一个可执行文件 `AIReplay-<版本号>.exe`（例如 `AIReplay-v1.0.3.exe`）。
 
-⚠️ 需要在仓库 **Settings → Secrets and variables → Actions** 里配置一个 Secret：
+需要在仓库 **Settings → Secrets and variables → Actions** 里配置一个 Secret：
 
 | Secret | 说明 |
 | --- | --- |
@@ -143,12 +146,14 @@ python AIReplay-check.py --version           # 打印当前版本号
 ```bash
 pip install pyinstaller
 export LICENSE_KEY=XXXX-XXXX-XXXX-XXXX       # 本地打包同样要提供授权码
-pyinstaller --noconsole --onefile --clean --collect-all customtkinter --name "AIReplay" AIReplay-check.py
+pyinstaller --noconsole --onefile --clean \
+  --icon "assets/app.ico" --add-data "assets/app.ico;assets" \
+  --collect-all customtkinter --name "AIReplay" AIReplay-check.py
 ```
 
 产物位于 `dist/AIReplay.exe`。
 
-> 本地打包出来的 exe 会带上**当时环境里的**授权码；正式发布请走 CI（由 Secret 注入），
+> 本地打包出来的 exe 会带上当时环境里的授权码；正式发布请走 CI（由 Secret 注入），
 > 避免把授权码写进本地脚本或忘记注入而打出打不开的包。
 
 ## 目录结构
@@ -158,5 +163,8 @@ AIReplay-check.py                     # 主程序（图形界面 + 静默模式�
 license_guard.py                      # 授权校验 SDK（随程序一起分发）
 requirements.txt                      # 运行 / 打包依赖
 .github/workflows/build-release.yml   # 自动构建并发布 Release
+assets/app.ico                        # 应用图标（exe 图标 + 窗口图标）
+assets/app.png                        # 图标的 512px 预览图
+tools/make_icon.py                    # 图标生成脚本（改配色 / 换造型后重新跑一次，同时重出上面两个文件）
 .aireplay_config.json                 # 运行期生成的本机配置（不入库）
 ```
