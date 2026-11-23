@@ -9,18 +9,18 @@ Replay 核查一体化脚本（图形界面版）
 界面用法:
   1. 打开窗口后在「工作台」选日期（默认「昨天」，可点快捷日期或自绘月历），点「开始核查」
   2. 四段阶段指示（抓取 → 导出 → 处理 → 复制）配细进度条，三块统计实时更新；日志可展开
-  3. 完成后就地出现「已复制 C1:L11」提示条，下方的预览表就是将被复制的内容
+  3. 完成后就地出现「已复制 C2:L11」提示条，下方的预览表就是将被复制的内容
   4. 左侧导航可切到「历史记录」（对已有产物再次复制 / 打开所在目录）与「设置」
      （筛选、排序、去重、剪贴板区域、完成后是否弹窗、界面动效、深浅色主题）
 
 输出与剪贴板:
   - xlsx 生成后不会自动打开文件（也不弹 Excel），只在结果卡片里展示路径
-  - 生成后立即把 xlsx 的 CLIPBOARD_RANGE 区域（默认 C1:L11）复制到剪贴板，
-    同时写「制表符文本 + HTML 表格」两种格式：
+  - 生成后立即把 xlsx 的 CLIPBOARD_RANGE 区域（默认 C2:L11，跳过表头）复制到剪贴板，
+    同时写「制表符文本 + HTML 表格」两种格式（HTML 里不带边框、不自动换行）：
       粘到 Excel / WPS → 按单元格铺开；粘到微信 / 飞书 / Word → 直接变成表格
   - 区域数据不足（当天行数少于 11）时自动裁掉尾部空行 / 空列，不会粘出一串空制表符
   - 剪贴板被其他程序占用导致失败时只记一条警告，报表本身不受影响
-  - 结果卡片提供「再次复制 C1:L11」，无需重跑抓取
+  - 结果卡片提供「再次复制 C2:L11」，无需重跑抓取
   - 关闭：设置页关掉「输出后自动复制」（写进 .aireplay_config.json 的 clipboard_enabled）
 
 命令行用法:
@@ -163,7 +163,7 @@ XLSX_NAME_TPL = "replay核查-{day}.xlsx"
 #   · 粘到微信 / 飞书 / Word → 直接变成表格
 # 设为空串 "" 或把 CLIPBOARD_ENABLED 改 False 即可关闭该行为（关闭后不产生任何副作用）。
 CLIPBOARD_ENABLED = True
-CLIPBOARD_RANGE = "C1:L11"
+CLIPBOARD_RANGE = "C2:L11"
 
 # 目标文件已存在时，是否先重命名保留旧文件（True=防覆盖，False=直接覆盖）
 PROTECT_EXISTING = True
@@ -1950,10 +1950,12 @@ def auto_fit_column_width(ws, padding=4, min_width=8, max_width=50):
 # 之所以同时写「文本 + HTML」两种格式：Excel 系粘贴走文本（TSV 按单元格铺开），
 # 微信 / 飞书 / Word 粘贴走 HTML（直接出表格），一份数据两处都能用。
 CLIPBOARD_CF_UNICODETEXT = 13
+# 粘到 Excel 时「不带边框、不自动换行」：样式全交出去，边框属性一律不写，
+# 单元格强制 nowrap（Excel 读 HTML 时会把 white-space:nowrap 翻成「不换行」）。
 CLIPBOARD_HTML_CSS = (
     "border-collapse:collapse;font-family:'Microsoft YaHei',sans-serif;font-size:10pt;"
 )
-CLIPBOARD_CELL_CSS = "padding:2px 6px 2px 6px;border:1px solid #B7BEC9;"
+CLIPBOARD_CELL_CSS = "padding:2px 6px 2px 6px;white-space:nowrap;mso-wrap-text:no;"
 
 
 def _clip_cell_text(value):
@@ -1987,8 +1989,8 @@ def read_xlsx_range(xlsx_path, cell_range):
     finally:
         wb.close()
 
-    # 区域是写死的 C1:L11，当天数据不足时会剩一片空单元格：尾部空行 / 空列一律裁掉，
-    # 否则粘到聊天窗口里会带出一串空白制表符。
+    # 区域是写死的 C2:L11（从第 2 行起，跳过表头），当天数据不足时会剩一片空单元格：
+    # 尾部空行 / 空列一律裁掉，否则粘到聊天窗口里会带出一串空白制表符。
     while rows and not any(cell.strip() for cell in rows[-1]):
         rows.pop()
     ncols = max((max((i + 1 for i, cell in enumerate(row) if cell.strip()), default=0)
@@ -2006,9 +2008,10 @@ def _cf_html_document(rows):
                          for cell in row) + "</tr>"
         for row in rows
     )
+    # 不写 border / 边框色：粘到 Excel 后就是无边框表格
     fragment = (
-        f'<table border="1" cellspacing="0" cellpadding="0" '
-        f'style="{CLIPBOARD_HTML_CSS}border:1px solid #B7BEC9;">{body}</table>'
+        f'<table border="0" cellspacing="0" cellpadding="0" '
+        f'style="{CLIPBOARD_HTML_CSS}">{body}</table>'
     )
     header_tpl = (
         "Version:1.0\r\n"
@@ -2224,7 +2227,7 @@ def process_csv(path, out_folder, day):
         auto_fit_column_width(ws)
 
     # 输出后直接把指定区域复制到剪贴板：不打开文件、不弹 Excel，复制完即可粘贴。
-    # 区域固定为 CLIPBOARD_RANGE（默认 C1:L11），数据不足时自动裁掉尾部空行空列。
+    # 区域固定为 CLIPBOARD_RANGE（默认 C2:L11，跳过表头），数据不足时自动裁掉尾部空行空列。
     clip = copy_xlsx_range_to_clipboard(out_path)
     if clip["ok"]:
         log(f"[剪贴板] 已复制 {clip['range']}（{clip['rows']} 行 × {clip['cols']} 列）"
@@ -3527,13 +3530,21 @@ if ctk is not None:
             ncol = max(len(r) for r in rows)
             xs, total_w = self._pv_col_x(ncol)
             total_h = len(rows) * self.PV_ROW_H + 8
-            for r in range(1, len(rows)):                 # 隔行底色（表头不着色）
-                if r % 2 == 0:
+            # 只有区域从第 1 行开始时，首行才是表头；C2:L11 这类跳过表头的区域
+            # 首行就是数据，别把它画成加粗灰字。
+            try:
+                from openpyxl.utils import range_boundaries
+                has_header = range_boundaries(self._preview_range)[1] == 1
+            except Exception:
+                has_header = True
+            first = 1 if has_header else 0
+            for r in range(first, len(rows)):             # 隔行底色（表头不着色）
+                if (r - first) % 2 == 1:
                     cv.create_rectangle(0, r * self.PV_ROW_H, total_w,
                                         (r + 1) * self.PV_ROW_H,
                                         fill=self._pal("stripe"), width=0)
             for r, row in enumerate(rows):
-                header = (r == 0)
+                header = has_header and (r == 0)
                 font = self._pv_font(bold=header)
                 color = self._pal("sub") if header else self._pal("text")
                 y = r * self.PV_ROW_H + self.PV_ROW_H // 2
@@ -3587,7 +3598,7 @@ if ctk is not None:
             head.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(head, text="历史记录", font=self.f_h1,
                          text_color=CLR["text"]).grid(row=0, column=0, sticky="w")
-            ctk.CTkLabel(head, text="输出目录里的报表，可直接再次复制 C1:L11",
+            ctk.CTkLabel(head, text="输出目录里的报表，可直接再次复制 C2:L11",
                          font=self.f_sub, text_color=CLR["sub"]).grid(row=1, column=0, sticky="w", pady=(3, 0))
             ctk.CTkButton(head, text="刷新", width=76, height=32, corner_radius=8, font=self.f_small,
                           fg_color=CLR["ghost"], hover_color=CLR["ghost_h"], text_color=CLR["text"],
